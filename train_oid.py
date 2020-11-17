@@ -19,7 +19,9 @@ from cv2 import cv2
 import torch
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import DatasetCatalog, MetadataCatalog, DatasetFromList, MapDataset, build_batch_data_loader
+from detectron2.data import DatasetCatalog, MetadataCatalog, DatasetFromList, MapDataset, build_batch_data_loader, \
+    DatasetMapper
+from detectron2.data.detection_utils import build_augmentation
 from detectron2.data.samplers import TrainingSampler
 from detectron2.engine import default_argument_parser, default_setup, PeriodicCheckpointer, launch
 from detectron2.modeling import META_ARCH_REGISTRY
@@ -28,6 +30,7 @@ from detectron2.structures import BoxMode, Instances, Boxes, BitMasks
 from detectron2.data import detection_utils
 from detectron2.utils import comm
 from detectron2.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter, EventStorage
+from detectron2.data import transforms as T
 from tqdm import tqdm
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -144,10 +147,12 @@ def create_descs_from_csv(mask_csv_path):
     return dataset_descs
 
 
-def make_mapper(dataset_name):
+def make_mapper(dataset_name, augmentations=None):
     metadata   = MetadataCatalog.get(dataset_name)
     images_dir = metadata.images_dir
     masks_dir  = metadata.masks_dir
+    if augmentations is not None:
+        augmentations = T.AugmentationList(augmentations)
 
     def _desc_to_example(desc: Dict):
         # Detectron2 Model Input Format:
@@ -160,37 +165,71 @@ def make_mapper(dataset_name):
         desc       = copy.deepcopy(desc)  # it will be modified by code below
         image_path = os.path.join(images_dir, f'{desc["image_id"]}.jpg')
         # shape: [H, W, C]
-        image      = detection_utils.read_image(image_path, format="BGR")
-        h, w, c    = origin_height, origin_width, origin_channels = image.shape
+        origin_image = detection_utils.read_image(image_path, format="BGR")
+        oh, ow, oc = origin_height, origin_width, origin_channels = origin_image.shape
+        if augmentations is not None:
+            aug_input   = T.AugInput(origin_image)
+            transforms  = augmentations(aug_input)
+            auged_image = aug_input.image
+        else:
+            auged_image = origin_image
+        ah, aw, ac = auged_height, auged_width, auged_channels = auged_image.shape
 
-        target  = Instances(image_size=(h, w))
+        target = Instances(image_size=(ah, aw))
         if 'fill gt_boxes':
             # shape: n_box, 4
             boxes     = np.array([anno['bbox'] for anno in desc['annotations']])
-            boxes_abs = boxes * np.array([w, h, w, h])
-            target.gt_boxes = Boxes(boxes_abs)
+            boxes_abs = boxes * np.array([aw, ah, aw, ah])
+            if augmentations is not None:
+                # clip transformed bbox to image size
+                boxes_auged = transforms.apply_box(np.array(boxes_abs)).clip(min=0)
+                boxes_auged = np.minimum(boxes_auged, np.array([aw, ah, aw, ah])[np.newaxis, :])
+            else:
+                boxes_auged = boxes_abs
+            target.gt_boxes = Boxes(boxes_auged)
         if 'fill gt_classes':
             classes = [anno['category_id'] for anno in desc['annotations']]
             classes = torch.tensor(classes, dtype=torch.int64)
             target.gt_classes = classes
         if 'fill gt_masks':
             mask_paths = [os.path.join(masks_dir, f'{anno["mask_id"]}.png') for anno in desc['annotations']]
-            masks = list(map(lambda p: cv2.resize(cv2.imread(p, flags=cv2.IMREAD_GRAYSCALE), dsize=(w, h)), mask_paths))
-            masks = np.array(masks) > MASK_THRESHOLD
-            masks = BitMasks(
-                torch.stack([torch.from_numpy(np.ascontiguousarray(x)) for x in masks])
+            masks = np.array(list(map(
+                lambda p: cv2.resize(cv2.imread(p, flags=cv2.IMREAD_GRAYSCALE), dsize=(ow, oh)), mask_paths
+            )))
+            if augmentations is not None:
+                masks_auged = np.array(list(map(
+                    lambda x: transforms.apply_segmentation(x), masks
+                )))
+            else:
+                masks_auged = masks
+            masks_auged = masks_auged > MASK_THRESHOLD
+            masks_auged = BitMasks(
+                torch.stack([torch.from_numpy(np.ascontiguousarray(x)) for x in masks_auged])
             )
-            target.gt_masks = masks
+            target.gt_masks = masks_auged
 
         return {
             # expected shape: [C, H, W]
-            "image"         : torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))),
-            "origin_height" : origin_height,
-            "origin_width"  : origin_width,
-            "instances"     : target,  # refer: annotations_to_instances()
+            "image"    : torch.as_tensor(np.ascontiguousarray(origin_image.transpose(2, 0, 1))),
+            "height"   : auged_height,
+            "width"    : auged_width,
+            "instances": target,  # refer: annotations_to_instances()
         }
 
     return _desc_to_example
+
+
+# register dataset
+for tv in ["train", "validation"]:
+    paths = get_paths(OID_DIR, tv)
+    ds_name = "oid_" + tv
+    if ds_name in DatasetCatalog.list():
+        DatasetCatalog.remove(ds_name)
+    # register oid dataset dicts.
+    DatasetCatalog.register("oid_" + tv, lambda x=paths['mask_csv']: get_descs(x))
+    # set oid metadata.
+    MetadataCatalog.get("oid_" + tv).set(images_dir=paths['images_dir'])
+    MetadataCatalog.get("oid_" + tv).set(masks_dir=paths['masks_dir'])
 
 
 # def do_test(cfg, model):
@@ -209,10 +248,12 @@ def make_mapper(dataset_name):
 #         results = list(results.values())[0]
 #     return results
 
+DATA_LOADER = None
+
 
 def main(args):
     print('_' * 60 + f'\nmain <- {args}')
-    if 'setup-args':
+    if 'setup(args)':
         cfg = get_cfg()
         cfg.merge_from_file(args.config_file)
         cfg.merge_from_list(args.opts)
@@ -221,99 +262,102 @@ def main(args):
             cfg, args
         )  # if you don't like any of the default setup, write your own setup code
 
-    # register dataset
-    for tv in ["train", "validation"]:
-        paths = get_paths(OID_DIR, tv)
-        # register oid dataset dicts.
-        DatasetCatalog.register("oid_" + tv, lambda x=paths['mask_csv']: get_descs(x))
-        # set oid metadata.
-        MetadataCatalog.get("oid_" + tv).set(images_dir=paths['images_dir'])
-        MetadataCatalog.get("oid_" + tv).set(masks_dir=paths['masks_dir'])
-
-    if 'build_model(cfg)':
-        meta_arch = cfg.MODEL.META_ARCHITECTURE
-        model = META_ARCH_REGISTRY.get(meta_arch)(cfg)
-        model.to(torch.device(cfg.MODEL.DEVICE))
+    if N_GPU > 0:
+        if 'build_model(cfg)':
+            meta_arch = cfg.MODEL.META_ARCHITECTURE
+            model = META_ARCH_REGISTRY.get(meta_arch)(cfg)
+            model.to(torch.device(cfg.MODEL.DEVICE))
 
     if 'do-train':
-        cfg, model, resume = cfg, model, False
-
-        model.train()
-        optimizer = build_optimizer(cfg, model)
-        scheduler = build_lr_scheduler(cfg, optimizer)
-
-        checkpointer = DetectionCheckpointer(
-            model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler
-        )
-        start_iter = (
-                checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
-        )
-        max_iter = cfg.SOLVER.MAX_ITER
-
-        periodic_checkpointer = PeriodicCheckpointer(
-            checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, max_iter=max_iter
-        )
-
-        writers = (
-            [
-                CommonMetricPrinter(max_iter),
-                JSONWriter(os.path.join(cfg.OUTPUT_DIR, "metrics.json")),
-                TensorboardXWriter(cfg.OUTPUT_DIR),
-            ]
-            if comm.is_main_process()
-            else []
-        )
-
         if 'build_detection_train_loader':
-            descs_train: List[Dict] = DatasetCatalog.get("oid_train")
-            descs_valid: List[Dict] = DatasetCatalog.get("oid_validation")
-
+            # oid dataset.
+            if 'get_detection_dataset_dicts':
+                descs_train: List[Dict] = DatasetCatalog.get("oid_train")
+                descs_valid: List[Dict] = DatasetCatalog.get("oid_validation")
             dataset = DatasetFromList(descs_train, copy=False)
-            dataset = MapDataset(dataset, make_mapper('oid_train'))
+            if 'DatasetMapper':
+                augs = build_augmentation(cfg, is_train=True)
+            dataset = MapDataset(dataset, make_mapper('oid_train', augs))
+            # coco dataset.
+            # descs_train: List[Dict] = DatasetCatalog.get("coco_2017_train")
+            # dataset = DatasetFromList(descs_train, copy=False)
+            # mapper = DatasetMapper(cfg, True)
+            # dataset = MapDataset(dataset, mapper)
 
             sampler = TrainingSampler(len(dataset))
             data_loader = build_batch_data_loader(
                 dataset,
                 sampler,
                 cfg.SOLVER.IMS_PER_BATCH,
-                aspect_ratio_grouping=False,  # cfg.DATALOADER.ASPECT_RATIO_GROUPING,
+                aspect_ratio_grouping=cfg.DATALOADER.ASPECT_RATIO_GROUPING,
                 num_workers=cfg.DATALOADER.NUM_WORKERS,
             )
-        logger = logging.getLogger("detectron2")
-        logger.info("Starting training from iteration {}".format(start_iter))
-        with EventStorage(start_iter) as storage:
-            for data, iteration in zip(data_loader, range(start_iter, max_iter)):
-                iteration = iteration + 1
-                storage.step()
+            global DATA_LOADER
+            DATA_LOADER = data_loader
 
-                loss_dict = model(data)
-                losses = sum(loss_dict.values())
-                assert torch.isfinite(losses).all(), loss_dict
+        if N_GPU > 0:
+            cfg, model, resume = cfg, model, False
 
-                loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
-                losses_reduced = sum(loss for loss in loss_dict_reduced.values())
-                if comm.is_main_process():
-                    storage.put_scalars(total_loss=losses_reduced, **loss_dict_reduced)
+            model.train()
+            optimizer = build_optimizer(cfg, model)
+            scheduler = build_lr_scheduler(cfg, optimizer)
 
-                optimizer.zero_grad()
-                losses.backward()
-                optimizer.step()
-                storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
-                scheduler.step()
+            checkpointer = DetectionCheckpointer(
+                model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler
+            )
+            start_iter = (
+                    checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
+            )
+            max_iter = cfg.SOLVER.MAX_ITER
 
-                # if (
-                #     cfg.TEST.EVAL_PERIOD > 0
-                #     and iteration % cfg.TEST.EVAL_PERIOD == 0
-                #     and iteration != max_iter
-                # ):
-                #     do_test(cfg, model)
-                #     # Compared to "train_net.py", the test results are not dumped to EventStorage
-                #     comm.synchronize()
+            periodic_checkpointer = PeriodicCheckpointer(
+                checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, max_iter=max_iter
+            )
 
-                if iteration - start_iter > 5 and (iteration % 20 == 0 or iteration == max_iter):
-                    for writer in writers:
-                        writer.write()
-                periodic_checkpointer.step(iteration)
+            writers = (
+                [
+                    CommonMetricPrinter(max_iter),
+                    JSONWriter(os.path.join(cfg.OUTPUT_DIR, "metrics.json")),
+                    TensorboardXWriter(cfg.OUTPUT_DIR),
+                ]
+                if comm.is_main_process()
+                else []
+            )
+            logger = logging.getLogger("detectron2")
+            logger.info("Starting training from iteration {}".format(start_iter))
+            with EventStorage(start_iter) as storage:
+                for data, iteration in zip(data_loader, range(start_iter, max_iter)):
+                    iteration = iteration + 1
+                    storage.step()
+
+                    loss_dict = model(data)
+                    losses = sum(loss_dict.values())
+                    assert torch.isfinite(losses).all(), loss_dict
+
+                    loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
+                    losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+                    if comm.is_main_process():
+                        storage.put_scalars(total_loss=losses_reduced, **loss_dict_reduced)
+
+                    optimizer.zero_grad()
+                    losses.backward()
+                    optimizer.step()
+                    storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
+                    scheduler.step()
+
+                    # if (
+                    #     cfg.TEST.EVAL_PERIOD > 0
+                    #     and iteration % cfg.TEST.EVAL_PERIOD == 0
+                    #     and iteration != max_iter
+                    # ):
+                    #     do_test(cfg, model)
+                    #     # Compared to "train_net.py", the test results are not dumped to EventStorage
+                    #     comm.synchronize()
+
+                    if iteration - start_iter > 5 and (iteration % 20 == 0 or iteration == max_iter):
+                        for writer in writers:
+                            writer.write()
+                    periodic_checkpointer.step(iteration)
 
 
 if __name__ == "__main__":
@@ -324,6 +368,9 @@ if __name__ == "__main__":
             '--config-file', 'configs-oid/mask_rcnn_R_50_FPN_3x.yaml',
             '--num-gpus', f'{N_GPU}',
             'SOLVER.IMS_PER_BATCH', '2', 'SOLVER.BASE_LR', '0.0025',
+            'DATASETS.TRAIN', '("oid_train", )',
+            'DATASETS.TEST', '("oid_validation", )',
+            # INPUT.FORMAT?  INPUT.MASK_FORMAT?
             # '--opts',
             # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
             # 'MODEL.DEVICE', 'cpu'
@@ -332,12 +379,26 @@ if __name__ == "__main__":
 
     print("Command Line Args:", ARGS)
 
-    # main(ARGS)
-    launch(
-        main,
-        ARGS.num_gpus,
-        num_machines=ARGS.num_machines,
-        machine_rank=ARGS.machine_rank,
-        dist_url=ARGS.dist_url,
-        args=(ARGS,),
-    )
+    # if 'dataset-statistic':
+    #     import pandas as pd
+    #     oid_train_dicts: List[Dict] = DatasetCatalog.get("oid_train")
+    #     oid_train_stat = pd.DataFrame(list(map(
+    #         lambda x: len(x['annotations']), oid_train_dicts
+    #     )))
+    #     oid_train_dicts: List[Dict] = DatasetCatalog.get("coco_2017_train")
+    #     coco_train_stat = pd.DataFrame(list(map(
+    #         lambda x: len(x['annotations']), oid_train_dicts
+    #     )))
+
+    if N_GPU == 0:
+        main(ARGS)
+    else:
+        launch(
+            main,
+            ARGS.num_gpus,
+            num_machines=ARGS.num_machines,
+            machine_rank=ARGS.machine_rank,
+            dist_url=ARGS.dist_url,
+            args=(ARGS,),
+        )
+

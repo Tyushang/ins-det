@@ -21,8 +21,11 @@ It also includes fewer abstraction, therefore is easier to add custom logic.
 
 import logging
 import os
+import sys
+import platform
 from collections import OrderedDict
 import torch
+from detectron2.data.samplers import TrainingSampler
 from torch.nn.parallel import DistributedDataParallel
 
 import detectron2.utils.comm as comm
@@ -32,6 +35,7 @@ from detectron2.data import (
     MetadataCatalog,
     build_detection_test_loader,
     build_detection_train_loader, get_detection_dataset_dicts, DatasetFromList, MapDataset, DatasetMapper,
+    build_batch_data_loader,
 )
 from detectron2.engine import default_argument_parser, default_setup, launch
 from detectron2.evaluation import (
@@ -57,7 +61,16 @@ from detectron2.utils.events import (
 
 logger = logging.getLogger("detectron2")
 
+# _____________________________ Config ________________________________________
+RUN_ON = 'local' if platform.node() == 'frank-note' else 'google-cloud'
 
+if RUN_ON == 'local':
+    DETECTRON2_DIR = '/data/venv-pytorch/detectron2'
+else:
+    DETECTRON2_DIR = os.path.join(os.path.expanduser('~'), 'jupyter/detectron2')
+
+
+# _____________________________ Functions _____________________________________
 def get_evaluator(cfg, dataset_name, output_folder=None):
     """
     Create evaluator(s) for a given dataset.
@@ -189,90 +202,103 @@ def do_train(cfg, model, resume=False):
             periodic_checkpointer.step(iteration)
 
 
-def setup(args):
-    """
-    Create configs-oid and perform basic setups.
-    """
-    cfg = get_cfg()
-    cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
-    cfg.freeze()
-    default_setup(
-        cfg, args
-    )  # if you don't like any of the default setup, write your own setup code
-    return cfg
-
-
 if __name__ == "__main__":
-
-    import platform
-    RUN_ON = 'local' if platform.node() == 'frank-note' else 'google-cloud'
-
-    if RUN_ON == 'local':
-        DETECTRON2_DIR = '/data/venv-pytorch/detectron2'
-    else:
-        DETECTRON2_DIR = os.path.join(os.path.expanduser('~'), 'jupyter/detectron2')
-
     # cd tools/
     # python ./plain_train_net2.py \
     #   --config-file /data/venv-pytorch/detectron2/configs-oid/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml \
     #   --num-gpus 1 SOLVER.IMS_PER_BATCH 2 SOLVER.BASE_LR 0.0025
     # os.chdir(PRJ_DIR + '/tools')
-    CLI_ARGS = [
-        '--config-file', DETECTRON2_DIR + '/configs-oid/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml',
-        '--num-gpus', '1', 'SOLVER.IMS_PER_BATCH', '2', 'SOLVER.BASE_LR', '0.0025',
-        # '--opts',
-        # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
-        # 'MODEL.DEVICE', 'cpu'
-    ]
+    if '--config-file' in sys.argv:
+        CLI_ARGS = sys.argv[1:]
+    else:
+        CLI_ARGS = [
+            '--config-file', DETECTRON2_DIR + '/configs/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml',
+            '--num-gpus', '1', 'SOLVER.IMS_PER_BATCH', '8', 'SOLVER.BASE_LR', '0.0025',
+            'DATASETS.TRAIN', '("coco_2017_val", )',
+            # '--opts',
+            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
+            # 'MODEL.DEVICE', 'cpu'
+        ]
 
-    args = default_argument_parser().parse_args(CLI_ARGS)
+    ARGS = default_argument_parser().parse_args(CLI_ARGS)
 
-    # # print("Command Line Args:", args)
-    # launch(
-    #     main,
-    #     args.num_gpus,
-    #     num_machines=args.num_machines,
-    #     machine_rank=args.machine_rank,
-    #     dist_url=args.dist_url,
-    #     args=(args,),
-    # )
+    if 'setup(args)':
+        args = ARGS
+        cfg = get_cfg()
+        cfg.merge_from_file(args.config_file)
+        cfg.merge_from_list(args.opts)
+        cfg.freeze()
+        default_setup(
+            cfg, args
+        )  # if you don't like any of the default setup, write your own setup code
 
-    cfg = setup(args)
-    print(cfg)
+    # if 'build_model(cfg)':
+    #     meta_arch = cfg.MODEL.META_ARCHITECTURE
+    #     model = META_ARCH_REGISTRY.get(meta_arch)(cfg)
+    #     model.to(torch.device(cfg.MODEL.DEVICE))
 
-    # data_loader = build_detection_train_loader(cfg)
-    if 'build_detection_train_loader':
-        dataset_dicts = get_detection_dataset_dicts(
-            cfg.DATASETS.TRAIN,
-            filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
-            min_keypoints=cfg.MODEL.ROI_KEYPOINT_HEAD.MIN_KEYPOINTS_PER_IMAGE
-            if cfg.MODEL.KEYPOINT_ON
-            else 0,
-            proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN if cfg.MODEL.LOAD_PROPOSALS else None,
-        )
-        dataset = DatasetFromList(dataset_dicts, copy=False)
+    if 'do-train':
+        ...
+        if 'build_detection_train_loader':
+            # all dataset_dicts w.r.t cfg.DATASETS.TRAIN will be flattened.
+            dataset_dicts = get_detection_dataset_dicts(
+                cfg.DATASETS.TRAIN,
+                filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
+                min_keypoints=cfg.MODEL.ROI_KEYPOINT_HEAD.MIN_KEYPOINTS_PER_IMAGE
+                if cfg.MODEL.KEYPOINT_ON
+                else 0,
+                proposal_files=cfg.DATASETS.PROPOSAL_FILES_TRAIN if cfg.MODEL.LOAD_PROPOSALS else None,
+            )
+            dataset = DatasetFromList(dataset_dicts, copy=False)
+            dataset = MapDataset(dataset, DatasetMapper(cfg, True))
 
-        mapper = DatasetMapper(cfg, True)
-        dataset = MapDataset(dataset, mapper)
+            sampler_name = cfg.DATALOADER.SAMPLER_TRAIN
+            logger = logging.getLogger(__name__)
+            logger.info("Using training sampler {}".format(sampler_name))
+            # TODO avoid if-else?
+            if sampler_name == "TrainingSampler":
+                sampler = TrainingSampler(len(dataset))
+            else:
+                raise ValueError("Unknown training sampler: {}".format(sampler_name))
+            data_loader = build_batch_data_loader(
+                dataset,
+                sampler,
+                cfg.SOLVER.IMS_PER_BATCH,
+                aspect_ratio_grouping=cfg.DATALOADER.ASPECT_RATIO_GROUPING,
+                num_workers=cfg.DATALOADER.NUM_WORKERS,
+            )
 
-    # model = build_model(cfg)
-    if 'build_model':
-        meta_arch = cfg.MODEL.META_ARCHITECTURE
-        model = META_ARCH_REGISTRY.get(meta_arch)(cfg)
-        model.to(torch.device(cfg.MODEL.DEVICE))
-    logger.info("Model:\n{}".format(model))
-    # if args.eval_only:
-    #     DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-    #         cfg.MODEL.WEIGHTS, resume=args.resume
-    #     )
-    #     return do_test(cfg, model)
-
-    distributed = comm.get_world_size() > 1
-    if distributed:
-        model = DistributedDataParallel(
-            model, device_ids=[comm.get_local_rank()], broadcast_buffers=False
-        )
-
-    do_train(cfg, model, resume=args.resume)
-    # return do_test(cfg, model)
+        # logger.info("Starting training from iteration {}".format(start_iter))
+        # with EventStorage(start_iter) as storage:
+        #     for data, iteration in zip(data_loader, range(start_iter, max_iter)):
+        #         iteration = iteration + 1
+        #         storage.step()
+        #
+        #         loss_dict = model(data)
+        #         losses = sum(loss_dict.values())
+        #         assert torch.isfinite(losses).all(), loss_dict
+        #
+        #         loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
+        #         losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+        #         if comm.is_main_process():
+        #             storage.put_scalars(total_loss=losses_reduced, **loss_dict_reduced)
+        #
+        #         optimizer.zero_grad()
+        #         losses.backward()
+        #         optimizer.step()
+        #         storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
+        #         scheduler.step()
+        #
+        #         if (
+        #                 cfg.TEST.EVAL_PERIOD > 0
+        #                 and iteration % cfg.TEST.EVAL_PERIOD == 0
+        #                 and iteration != max_iter
+        #         ):
+        #             do_test(cfg, model)
+        #             # Compared to "train_net.py", the test results are not dumped to EventStorage
+        #             comm.synchronize()
+        #
+        #         if iteration - start_iter > 5 and (iteration % 20 == 0 or iteration == max_iter):
+        #             for writer in writers:
+        #                 writer.write()
+        #         periodic_checkpointer.step(iteration)

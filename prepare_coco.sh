@@ -1,9 +1,11 @@
 #!/bin/bash -e
 
+# 详见：https://cocodataset.org/#download
+
 cd /home/jupyter/datasets/coco
 # wget images
 wget http://images.cocodataset.org/zips/train2017.zip
-wget http://images.cocodataset.org/zips/val2017.zip
+wget http://images.cocodataset.org/zips/val2017.zip     # N_IMAGE: 5000, size: 787MB
 wget http://images.cocodataset.org/zips/test2017.zip
 # wget annotations and info (.json format)
 wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
