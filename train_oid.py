@@ -40,38 +40,9 @@ from prepare_oid import make_mapper
 # ____________________________ Config __________________________________________
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 N_GPU  = torch.cuda.device_count()
-RUN_ON = 'local' if platform.node() == 'frank-note' else 'google-cloud'
-
-if RUN_ON == 'local':
-    DETECTRON2_DIR = '/data/venv-pytorch/detectron2'
-    OID_DIR        = '/data/venv-tensorflow2/open-images-dataset'
-else:
-    DETECTRON2_DIR = '/home/tyushang_gmail_com/jupyter/detectron2'
-    OID_DIR        = '/home/jupyter/datasets/oid'
-
-MASK_THRESHOLD = 127
 
 
-# def do_test(cfg, model):
-#     results = OrderedDict()
-#     for dataset_name in cfg.DATASETS.TEST:
-#         data_loader = build_detection_test_loader(cfg, dataset_name)
-#         evaluator = get_evaluator(
-#             cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
-#         )
-#         results_i = inference_on_dataset(model, data_loader, evaluator)
-#         results[dataset_name] = results_i
-#         if comm.is_main_process():
-#             logger.info("Evaluation results for {} in csv format:".format(dataset_name))
-#             print_csv_format(results_i)
-#     if len(results) == 1:
-#         results = list(results.values())[0]
-#     return results
-
-DATA_LOADER = None
-CONFIG = None
-
-
+# ____________________________ For Debug _______________________________________
 class MemStatsInDataFrame:
     def __init__(self):
         self.all_ms_df: pd.DataFrame = None
@@ -91,12 +62,31 @@ class MemStatsInDataFrame:
         self.all_ms_df.to_csv(path, index_label='memo')
 
 
-# __________________ For Debug _____________________________
-tic = None
-
 mem_stats_df = MemStatsInDataFrame()
 # tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 # tcp_sock.connect(('localhost', 9999))
+
+DATA_LOADER = None
+CONFIG      = None
+TIC         = None
+
+
+# ____________________________ Main for Train __________________________________
+# def do_test(cfg, model):
+#     results = OrderedDict()
+#     for dataset_name in cfg.DATASETS.TEST:
+#         data_loader = build_detection_test_loader(cfg, dataset_name)
+#         evaluator = get_evaluator(
+#             cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
+#         )
+#         results_i = inference_on_dataset(model, data_loader, evaluator)
+#         results[dataset_name] = results_i
+#         if comm.is_main_process():
+#             logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+#             print_csv_format(results_i)
+#     if len(results) == 1:
+#         results = list(results.values())[0]
+#     return results
 
 
 def main(args):
@@ -226,13 +216,13 @@ def main(args):
                         # __________________ For Debug _____________________________
                         # mem_summary = torch.cuda.memory_summary()
                         # tcp_sock.send(mem_summary.encode('utf-8'))
-                        global tic
-                        if tic is None:
-                            tic = datetime.datetime.now()
+                        global TIC
+                        if TIC is None:
+                            TIC = datetime.datetime.now()
                         else:
                             toc = datetime.datetime.now()
-                            print('_' * 35 + f'Time Elapsed: {(toc - tic).total_seconds()} s')
-                            tic = toc
+                            print('_' * 35 + f'Time Elapsed: {(toc - TIC).total_seconds()} s')
+                            TIC = toc
 
                     periodic_checkpointer.step(iteration)
 

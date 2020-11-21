@@ -106,7 +106,7 @@ if __name__ == "__main__":
     if 'predict and visualization':
         for path in args.input:
             raw_image = read_image(path, format="BGR")
-            tic       = time.time()
+            TIC       = time.time()
             # prediction
             with torch.no_grad():  # https://github.com/sphinx-doc/sphinx/issues/4258
                 height, width = raw_image.shape[:2]
@@ -118,7 +118,7 @@ if __name__ == "__main__":
                 pred_all = predictor.model([inputs])
                 # {'instances': detectron2.structures.instances.Instances}
                 pred     = pred_all[0]
-            print(f'time elapsed: {time.time() - tic:.3f}s')
+            print(f'time elapsed: {time.time() - TIC:.3f}s')
 
             visualizer = Visualizer(raw_image[:, :, ::-1])
             # noinspection DuplicatedCode

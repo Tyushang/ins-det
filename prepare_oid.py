@@ -8,15 +8,20 @@ import copy
 import os
 import pickle
 import platform
+import sys
 from typing import *
 
 import numpy as np
 import pandas as pd
 import torch
 from cv2 import cv2
-from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.config import get_cfg
+from detectron2.data import DatasetCatalog, MetadataCatalog, DatasetFromList, MapDataset, build_batch_data_loader
 from detectron2.data import detection_utils
 from detectron2.data import transforms as T
+from detectron2.data.detection_utils import build_augmentation
+from detectron2.data.samplers import TrainingSampler
+from detectron2.engine import default_argument_parser, default_setup
 from detectron2.structures import BoxMode, Instances, Boxes, BitMasks
 from tqdm import tqdm
 
@@ -215,5 +220,88 @@ for tv in ["train", "validation"]:
 
 
 if __name__ == "__main__":
-    ...
+    if '--config-file' in sys.argv:
+        CLI_ARGS = sys.argv[1:]
+    else:
+        CLI_ARGS = [
+            '--config-file', DETECTRON2_DIR + '/configs/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml',
+            '--num-gpus', '1', 'SOLVER.IMS_PER_BATCH', '8', 'SOLVER.BASE_LR', '0.0025',
+            'DATASETS.TRAIN', '("coco_2017_val", )',
+            # '--opts',
+            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
+            # 'MODEL.DEVICE', 'cpu'
+        ]
+
+    ARGS = default_argument_parser().parse_args(CLI_ARGS)
+
+    if 'setup(args)':
+        args = ARGS
+        cfg = get_cfg()
+        cfg.merge_from_file(args.config_file)
+        cfg.merge_from_list(args.opts)
+        cfg.freeze()
+        default_setup(
+            cfg, args
+        )  # if you don't like any of the default setup, write your own setup code
+
+    if 'build_detection_train_loader':
+        if 'get_detection_dataset_dicts':
+            descs_train: List[Dict] = DatasetCatalog.get("oid_train")
+            descs_valid: List[Dict] = DatasetCatalog.get("oid_validation")
+        dataset = DatasetFromList(descs_train, copy=False)
+        if 'DatasetMapper':
+            augs = build_augmentation(cfg, is_train=True)
+            mapper = make_mapper('oid_train', T.AugmentationList(augs))
+        dataset = MapDataset(dataset, mapper)
+
+        sampler = TrainingSampler(len(dataset))
+        data_loader = build_batch_data_loader(
+            dataset,
+            sampler,
+            cfg.SOLVER.IMS_PER_BATCH,
+            aspect_ratio_grouping=cfg.DATALOADER.ASPECT_RATIO_GROUPING,
+            num_workers=cfg.DATALOADER.NUM_WORKERS,
+        )
+
+    if 'visualization':
+        from matplotlib import pyplot as plt
+        from detectron2.utils.visualizer import *
+
+        def show(visualizer):
+            plt.imshow(visualizer.get_output().get_image())
+            plt.show()
+
+        itr = data_loader.__iter__()
+
+        batch = itr.__next__()
+        exam = batch[0]
+        exam['instances']
+
+        v = Visualizer(exam['image'].numpy().transpose(1, 2, 0))
+        show(v)
+
+        def draw_masks(vis: Visualizer, ins: Instances):
+            for mask in ins.get_fields()['gt_masks']:
+                vis.draw_binary_mask(mask.numpy())
+
+        draw_masks(v, exam['instances'])
+        show(v)
+
+        def draw_boxes(vis: Visualizer, ins: Instances):
+            for box in ins.get_fields()['gt_boxes']:
+                vis.draw_box(box)
+
+        draw_boxes(v, exam['instances'])
+        show(v)
+
+        def draw_instances(vis: Visualizer, ins: Instances):
+            f = ins.get_fields()
+            vis.overlay_instances(boxes=f['gt_boxes'],
+                                  labels=f['gt_classes'].tolist(),
+                                  masks=f['gt_masks'])
+
+        draw_instances(v, exam['instances'])
+        show(v)
+
+
 
