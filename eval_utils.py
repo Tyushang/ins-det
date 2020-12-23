@@ -279,6 +279,14 @@ class TfodEvaluator(DatasetEvaluator):
                 return {}
         else:
             raw_preds = self.all_ptd2_preds
+
+        # TODO: does removing images with null predictions affect metrics?
+        if 'filter images with predictions.':
+            raw_preds = list(filter(lambda x: len(x['instances']) > 0, raw_preds))
+            if len(raw_preds) == 0:
+                print("_"*60 + "There's no predictions.")
+                return
+
         image_ids = [x['image_id'] for x in raw_preds]
         all_location_annotations = self.gt_bboxes[self.gt_bboxes['ImageID'].isin(image_ids)]
         all_label_annotations    = self.gt_image_labels[self.gt_image_labels['ImageID'].isin(image_ids)]
