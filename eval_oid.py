@@ -76,7 +76,8 @@ def do_test(cfg, model):
                 descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
             # validation dataset is too large.
             print(descs_valid)
-            descs_valid = random.choices(descs_valid, k=50)
+            random.seed(2020)
+            descs_valid = random.choices(descs_valid, k=100)
             dataset = DatasetFromList(descs_valid)
             if 'DatasetMapper':
                 mapper = make_mapper(dataset_name, is_train=False, augmentations=None)
@@ -153,7 +154,10 @@ if __name__ == "__main__":
         CLI_ARGS = sys.argv[1:]
     else:
         CLI_ARGS = [
-            '--config-file', 'configs-oid/mask_rcnn_R_50_FPN_3x.yaml',
+            # '--config-file', 'configs-oid/mask_rcnn_R_50_FPN_3x.yaml',
+            '--config-file', './output-save/config.yaml',
+            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
+            'MODEL.WEIGHTS', './output-save/model_0017999.pth',
             'MODEL.DEVICE', 'cpu',
             'SOLVER.IMS_PER_BATCH', '4', 'SOLVER.BASE_LR', '0.0025',
             'DATASETS.TRAIN', '("oid_train", )',
