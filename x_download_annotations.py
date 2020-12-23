@@ -98,6 +98,7 @@ DOWNLOAD_DESC = {
         'metadata'  : {
             'challenge-2019-classes-description-segmentable.csv': 'https://storage.googleapis.com/openimages/challenge_2019/challenge-2019-classes-description-segmentable.csv',
             'challenge-2019-label300-segmentable-hierarchy.json': 'https://storage.googleapis.com/openimages/challenge_2019/challenge-2019-label300-segmentable-hierarchy.json',
+            'oid_object_detection_challenge_500_label_map.pbtxt': 'https://github.com/tensorflow/models/blob/2986bcafb9eaa8fed4d78f17a04c4c5afc8f6691/research/object_detection/data/oid_object_detection_challenge_500_label_map.pbtxt',
         },
     },
     # Visual Relationships Detection track anno

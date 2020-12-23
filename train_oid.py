@@ -2,12 +2,15 @@
 # -*- coding: utf-8 -*-
 
 # __author__="Frank Jing"
-
-
+import contextlib
 import copy
 import datetime
+import io
+import itertools
+import json
 import logging
 import os
+import random
 import socket
 import sys
 import pickle
@@ -22,10 +25,16 @@ import torch
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog, DatasetFromList, MapDataset, build_batch_data_loader, \
-    DatasetMapper
+    DatasetMapper, build_detection_test_loader
+from detectron2.data.build import trivial_batch_collator
+from detectron2.data.datasets.coco import convert_to_coco_json
 from detectron2.data.detection_utils import build_augmentation
-from detectron2.data.samplers import TrainingSampler
+from detectron2.data.samplers import TrainingSampler, InferenceSampler
 from detectron2.engine import default_argument_parser, default_setup, PeriodicCheckpointer, launch
+from detectron2.evaluation import inference_on_dataset, print_csv_format, SemSegEvaluator, COCOEvaluator, \
+    COCOPanopticEvaluator, CityscapesInstanceEvaluator, CityscapesSemSegEvaluator, PascalVOCDetectionEvaluator, \
+    LVISEvaluator, DatasetEvaluators, DatasetEvaluator
+from detectron2.evaluation.coco_evaluation import instances_to_coco_json, _evaluate_predictions_on_coco
 from detectron2.modeling import META_ARCH_REGISTRY
 from detectron2.solver import build_optimizer, build_lr_scheduler
 from detectron2.structures import BoxMode, Instances, Boxes, BitMasks
@@ -33,13 +42,54 @@ from detectron2.data import detection_utils
 from detectron2.utils import comm
 from detectron2.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter, EventStorage
 from detectron2.data import transforms as T
+from detectron2.utils.logger import create_small_table
+from fvcore.common.file_io import PathManager
+from pycocotools.coco import COCO
+from tabulate import tabulate
 from tqdm import tqdm
 
+from eval_utils import MyCocoEvaluator, get_evaluator2
 from prepare_oid import make_mapper
 
-# ____________________________ Config __________________________________________
+# ____________________________ Build Environment _______________________________
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-N_GPU  = torch.cuda.device_count()
+# clear_descs_cache()
+RUN_ON = 'local' if platform.node() == 'frank-note' \
+    else 'google' if platform.node() == 'tyu-det' \
+    else 'kaggle'
+
+if RUN_ON == 'local':
+    DETECTRON2_DIR = '/data/venv-pytorch/detectron2'
+else:
+    DETECTRON2_DIR = '/home/tyushang_gmail_com/jupyter/detectron2'
+
+# ____________________________ Config __________________________________________
+N_GPUS  = torch.cuda.device_count()
+N_IMAGES_TRAIN = 847_997
+
+IMS_PER_GPU = 4
+BATCH_SIZE  = N_GPUS * IMS_PER_GPU
+
+N_EPOCHS = 1
+N_STEPS  = (N_IMAGES_TRAIN * N_EPOCHS) // BATCH_SIZE
+
+N_IMAGES_PER_TEST = 100
+
+MILESTONES_RATIO = (0.77, 0.92)
+MILESTONES       = tuple([int(m * N_STEPS) for m in MILESTONES_RATIO])
+
+DS_TYPE = 'oid'  # oid or coco
+if DS_TYPE == 'oid':
+    CONFIG_FILE = './configs-oid/mask_rcnn_R_50_FPN_3x.yaml'
+    # WEIGHTS  = './weights/model_final_f10217_without_roi_heads.pkl'
+    WEIGHTS  = './output-save/model_0017999.pth'
+    DS_TRAIN = 'oid_train'
+    DS_VALID = 'oid_validation'
+else:
+    CONFIG_FILE = os.path.join(DETECTRON2_DIR, 'configs/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml')
+    WEIGHTS  = './weights/model_final_f10217.pkl'
+    DS_TRAIN = 'coco_2017_train'
+    DS_VALID = 'coco_2017_val'
 
 
 # ____________________________ For Debug _______________________________________
@@ -70,23 +120,65 @@ DATA_LOADER = None
 CONFIG      = None
 TIC         = None
 
+logger = logging.getLogger("detectron2")
+
 
 # ____________________________ Main for Train __________________________________
-# def do_test(cfg, model):
-#     results = OrderedDict()
-#     for dataset_name in cfg.DATASETS.TEST:
-#         data_loader = build_detection_test_loader(cfg, dataset_name)
-#         evaluator = get_evaluator(
-#             cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
-#         )
-#         results_i = inference_on_dataset(model, data_loader, evaluator)
-#         results[dataset_name] = results_i
-#         if comm.is_main_process():
-#             logger.info("Evaluation results for {} in csv format:".format(dataset_name))
-#             print_csv_format(results_i)
-#     if len(results) == 1:
-#         results = list(results.values())[0]
-#     return results
+# noinspection DuplicatedCode,PyMethodMayBeStatic
+
+def do_test(cfg, model):
+    results = OrderedDict()
+    for dataset_name in cfg.DATASETS.TEST:
+        # data_loader = build_detection_test_loader(cfg, dataset_name)
+        if 'build_detection_test_loader':
+            if dataset_name == 'coco_2017_val':
+                dicts_valid: List[Dict] = DatasetCatalog.get(dataset_name)
+                if "filter_empty and has_instances":
+                    ...
+                dataset = DatasetFromList(dicts_valid, copy=False)
+                mapper = DatasetMapper(cfg, is_train=False)
+            else:  # Open-Image-Dataset
+                if 'get_detection_dataset_dicts':
+                    descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
+                # validation dataset is too large.
+                descs_valid = random.choices(descs_valid, k=N_IMAGES_PER_TEST)
+                # TODO: clear cache.
+                dataset = DatasetFromList(descs_valid)
+                if 'DatasetMapper':
+                    mapper = make_mapper(dataset_name, is_train=False, augmentations=None)
+
+            dataset = MapDataset(dataset, mapper)
+
+            sampler = InferenceSampler(len(dataset))
+            # Always use 1 image per worker during inference since this is the
+            # standard when reporting inference time in papers.
+            batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, 1, drop_last=False)
+
+            data_loader = torch.utils.data.DataLoader(
+                dataset,
+                num_workers=cfg.DATALOADER.NUM_WORKERS,
+                batch_sampler=batch_sampler,
+                collate_fn=trivial_batch_collator,
+            )
+
+        evaluator = get_evaluator2(
+            cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
+        )
+
+        results_i = inference_on_dataset(model, data_loader, evaluator)
+        # results[dataset_name] = results_i
+        # TODO: Multiprocessing? Why so slow in gcloud.
+        print('_'*30 + 'if comm.is_main_process():')
+        if comm.is_main_process():
+            logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+            # print_csv_format(results_i)
+            for tsk, res in results_i.items():
+                res_df = pd.DataFrame(pd.Series(res, name='value'))
+                res_df = res_df[res_df['value'].notna()]
+                res_df.index = res_df.index.map(lambda x: '/'.join(x.split('/')[1:]))
+                pd.set_option('display.max_rows', None)
+                print(res_df)
+                pd.reset_option('display.max_rows')
 
 
 def main(args):
@@ -102,7 +194,7 @@ def main(args):
         global CONFIG
         CONFIG = cfg
 
-    if N_GPU > 0:
+    if True:  # N_GPU > 0:
         # __________________ For Debug _____________________________
         # mem_stats_df.record('Before-Build-Model')
         if 'build_model(cfg)':
@@ -111,6 +203,12 @@ def main(args):
             model.to(torch.device(cfg.MODEL.DEVICE))
         # __________________ For Debug _____________________________
         # mem_stats_df.record('After-Build-Model')
+
+    if args.eval_only:
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS, resume=args.resume
+        )
+        return do_test(cfg, model)
 
     if 'do-train':
         if 'build_detection_train_loader':
@@ -121,11 +219,10 @@ def main(args):
             else:  # Open-Image-Dataset
                 if 'get_detection_dataset_dicts':
                     descs_train: List[Dict] = DatasetCatalog.get("oid_train")
-                    descs_valid: List[Dict] = DatasetCatalog.get("oid_validation")
                 dataset = DatasetFromList(descs_train, copy=False)
                 if 'DatasetMapper':
                     augs = build_augmentation(cfg, is_train=True)
-                    mapper = make_mapper('oid_train', T.AugmentationList(augs))
+                    mapper = make_mapper('oid_train', is_train=True, augmentations=T.AugmentationList(augs))
             dataset = MapDataset(dataset, mapper)
 
             sampler = TrainingSampler(len(dataset))
@@ -139,8 +236,8 @@ def main(args):
             global DATA_LOADER
             DATA_LOADER = data_loader
 
-        if N_GPU > 0:
-            cfg, model, resume = cfg, model, False
+        if N_GPUS > 0:
+            cfg, model, resume = cfg, model, args.resume
 
             model.train()
             optimizer = build_optimizer(cfg, model)
@@ -167,7 +264,6 @@ def main(args):
                 if comm.is_main_process()
                 else []
             )
-            logger = logging.getLogger("detectron2")
             logger.info("Starting training from iteration {}".format(start_iter))
 
             # __________________ For Debug _____________________________
@@ -184,11 +280,10 @@ def main(args):
                     # __________________ For Debug _____________________________
                     # mem_stats_df.record('Before-Forward')
                     loss_dict = model(data)
-                    # __________________ For Debug _____________________________
-                    # mem_stats_df.record('After-Forward')
-
                     losses = sum(loss_dict.values())
                     assert torch.isfinite(losses).all(), loss_dict
+                    # __________________ For Debug _____________________________
+                    # mem_stats_df.record('After-Forward')
 
                     loss_dict_reduced = {k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
                     losses_reduced = sum(loss for loss in loss_dict_reduced.values())
@@ -201,16 +296,19 @@ def main(args):
                     storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
                     scheduler.step()
 
-                    # if (
-                    #     cfg.TEST.EVAL_PERIOD > 0
-                    #     and iteration % cfg.TEST.EVAL_PERIOD == 0
-                    #     and iteration != max_iter
-                    # ):
-                    #     do_test(cfg, model)
-                    #     # Compared to "train_net.py", the test results are not dumped to EventStorage
-                    #     comm.synchronize()
+                    # __________________ Checkpoint / Test / Metrics ___________
+                    periodic_checkpointer.step(iteration)
 
-                    if iteration - start_iter > 5 and (iteration % 20 == 0 or iteration == max_iter):
+                    if (
+                        cfg.TEST.EVAL_PERIOD > 0
+                        and iteration % cfg.TEST.EVAL_PERIOD == 0
+                        and iteration != max_iter
+                    ):
+                        do_test(cfg, model)
+                        # Compared to "train_net.py", the test results are not dumped to EventStorage
+                        comm.synchronize()
+
+                    if iteration - start_iter > 5 and (iteration % 100 == 0 or iteration == max_iter):
                         for writer in writers:
                             writer.write()
                         # __________________ For Debug _____________________________
@@ -221,10 +319,8 @@ def main(args):
                             TIC = datetime.datetime.now()
                         else:
                             toc = datetime.datetime.now()
-                            print('_' * 35 + f'Time Elapsed: {(toc - TIC).total_seconds()} s')
+                            logger.info('_' * 35 + f'Time Elapsed: {(toc - TIC).total_seconds()} s')
                             TIC = toc
-
-                    periodic_checkpointer.step(iteration)
 
             # __________________ For Debug _____________________________
             # mem_stats_df.dump('./mem_stats_df.csv')
@@ -235,17 +331,20 @@ if __name__ == "__main__":
         CLI_ARGS = sys.argv[1:]
     else:
         CLI_ARGS = [
-            '--config-file', 'configs-oid/mask_rcnn_R_50_FPN_3x.yaml',
-            '--num-gpus', f'{N_GPU}',
-            'SOLVER.IMS_PER_BATCH', '4', 'SOLVER.BASE_LR', '0.0025',
-            'DATASETS.TRAIN', '("oid_train", )',
-            'DATASETS.TEST', '("oid_validation", )',
+            '--config-file', f'{CONFIG_FILE}', '--num-gpus', f'{N_GPUS}',
+            '--eval-only',
+            '--resume',
+            'MODEL.WEIGHTS', f'{WEIGHTS}',
+            'DATASETS.TRAIN', f'("{DS_TRAIN}", )', 'DATASETS.TEST', f'("{DS_VALID}", )',
+            'SOLVER.IMS_PER_BATCH', f'{BATCH_SIZE}',
+            'SOLVER.BASE_LR', '0.0025',
+            'SOLVER.MAX_ITER', f'{N_STEPS}',
+            'SOLVER.STEPS', f'{MILESTONES}',
+            'TEST.EVAL_PERIOD', '3000',
+            'SOLVER.CHECKPOINT_PERIOD', '3000',
             # For Debug ____________________
-            # 'SOLVER.MAX_ITER', '20_000',
             # INPUT.FORMAT?  INPUT.MASK_FORMAT?
-            # '--opts',
-            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
-            # 'MODEL.DEVICE', 'cpu'
+            # 'MODEL.DEVICE', 'gpu' if N_GPU > 0 else 'cpu',
         ]
     ARGS = default_argument_parser().parse_args(CLI_ARGS)
 
@@ -262,7 +361,7 @@ if __name__ == "__main__":
     #         lambda x: len(x['annotations']), oid_train_dicts
     #     )))
 
-    if N_GPU == 0:
+    if N_GPUS == 0:
         main(ARGS)
     else:
         launch(

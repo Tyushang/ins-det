@@ -3,20 +3,27 @@ import argparse
 import glob
 import multiprocessing as mp
 import os
+import random
 import time
+from typing import List, Dict
+
 import cv2
 import torch
 import tqdm
 
 from detectron2.config import get_cfg
+from detectron2.data import DatasetCatalog, DatasetFromList, DatasetMapper, MapDataset
+from detectron2.data.build import trivial_batch_collator
 from detectron2.data.detection_utils import read_image
+from detectron2.data.samplers import InferenceSampler
+from detectron2.evaluation import inference_context
 from detectron2.utils.logger import setup_logger
-from engine import DefaultPredictor
+from detectron2.engine import DefaultPredictor
 
-from predictor import VisualizationDemo
+from detectron2.utils.visualizer import Visualizer
 
 # constants
-from utils.visualizer import Visualizer
+from prepare_oid import make_mapper
 
 WINDOW_NAME = "COCO detections"
 
@@ -73,17 +80,19 @@ def get_parser():
 
 if __name__ == "__main__":
 
-    PRJ_DIR = '/data/venv-pytorch/detectron2'
+    PRJ_DIR = '/data/venv-pytorch/ins-det'
 
     import platform
     RUN_ON = 'local' if platform.node() == 'frank-note' else 'google-cloud'
     if RUN_ON == 'local':
-        os.chdir(PRJ_DIR + '/tyu')
+        os.chdir(PRJ_DIR)
     CLI_ARGS = [
-        '--config-file', '../configs-oid/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml',
+        # '--config-file', './configs-det/COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml',
+        '--config-file', './output-save/config.yaml',
         '--input', './sample_images/input1.jpg', './sample_images/input2.jpg',
         '--opts',
-        'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
+        # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
+        'MODEL.WEIGHTS', './output-save/model_0017999.pth',
         'MODEL.DEVICE', 'cpu'
     ]
 
@@ -98,14 +107,76 @@ if __name__ == "__main__":
     # predictor is a wrapper of model. use predictor.model to get model.
     # /type model: detectron2.modeling.meta_arch.rcnn.GeneralizedRCNN
     predictor = DefaultPredictor(cfg)
-    # weights:
-    # import pickle
-    # with open(cfg.MODEL.WEIGHTS, 'rb') as f:
-    #     weights = pickle.load(f, encoding='latin1')
+    model     = predictor.model
 
-    if 'predict and visualization':
+    INP_TYPE = 'dataloader'  # or dataloader
+    if INP_TYPE == 'manual':
+        pred_all = []
         for path in args.input:
             raw_image = read_image(path, format="BGR")
+            with torch.no_grad():  # https://github.com/sphinx-doc/sphinx/issues/4258
+                height, width = raw_image.shape[:2]
+                img = predictor.aug.get_transform(raw_image).apply_image(raw_image)
+                # here: image shape should be [C, H, W], and BGR format
+                img = torch.as_tensor(img.astype("float32").transpose(2, 0, 1))
+
+                inputs = {"image": img, "height": height, "width": width}
+                pred = predictor.model([inputs])[0]
+                # {'instances': detectron2.structures.instances.Instances}
+                pred_all.append(pred)
+
+                visualizer = Visualizer(raw_image[:, :, ::-1])
+                # noinspection DuplicatedCode
+                if "panoptic_seg" in pred:
+                    ...
+                else:
+                    if "sem_seg" in pred:
+                        pred_vis = visualizer.draw_sem_seg(
+                            pred["sem_seg"].argmax(dim=0).to(torch.device("cpu"))
+                        )
+                    if "instances" in pred:
+                        instances = pred["instances"].to(torch.device("cpu"))
+                        pred_vis = visualizer.draw_instance_predictions(predictions=instances)
+
+                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                cv2.imshow(WINDOW_NAME, pred_vis.get_image()[:, :, ::-1])
+                if cv2.waitKey(delay=5) == 27:
+                    break  # esc to quit
+
+    elif INP_TYPE == 'dataloader':
+        dataset_name = 'coco_2017_val'
+        if dataset_name == 'coco_2017_val':
+            dicts_valid: List[Dict] = DatasetCatalog.get(dataset_name)
+            if "filter_empty and has_instances":
+                ...
+            dataset = DatasetFromList(dicts_valid, copy=False)
+            mapper = DatasetMapper(cfg, is_train=False)
+        else:  # Open-Image-Dataset
+            if 'get_detection_dataset_dicts':
+                descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
+            # validation dataset is too large.
+            descs_valid = random.choices(descs_valid, k=200)
+            # TODO: clear cache.
+            dataset = DatasetFromList(descs_valid)
+            if 'DatasetMapper':
+                mapper = make_mapper(dataset_name, is_train=False, augmentations=None)
+
+        dataset = MapDataset(dataset, mapper)
+
+        sampler = InferenceSampler(len(dataset))
+        # Always use 1 image per worker during inference since this is the
+        # standard when reporting inference time in papers.
+        batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, 1, drop_last=False)
+
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=cfg.DATALOADER.NUM_WORKERS,
+            batch_sampler=batch_sampler,
+            collate_fn=trivial_batch_collator,
+        )
+
+        for i, inp in enumerate(data_loader):
+            raw_image = read_image(inp[0]['file_name'], format="BGR")
             TIC       = time.time()
             # prediction
             with torch.no_grad():  # https://github.com/sphinx-doc/sphinx/issues/4258
@@ -117,8 +188,8 @@ if __name__ == "__main__":
                 inputs = {"image": img, "height": height, "width": width}
                 pred_all = predictor.model([inputs])
                 # {'instances': detectron2.structures.instances.Instances}
-                pred     = pred_all[0]
-            print(f'time elapsed: {time.time() - TIC:.3f}s')
+                pred = pred_all[0]
+                print(pred)
 
             visualizer = Visualizer(raw_image[:, :, ::-1])
             # noinspection DuplicatedCode
@@ -135,6 +206,6 @@ if __name__ == "__main__":
 
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.imshow(WINDOW_NAME, pred_vis.get_image()[:, :, ::-1])
-            if cv2.waitKey(0) == 27:
+            if cv2.waitKey(delay=5) == 27:
                 break  # esc to quit
 

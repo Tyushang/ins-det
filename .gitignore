@@ -2,7 +2,7 @@
 .idea/
 weights/
 *.swp
-output/
+output*/
 
 
 # ______________________ python gitignore from github __________________________
