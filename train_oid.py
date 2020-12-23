@@ -141,6 +141,7 @@ def do_test(cfg, model):
                 if 'get_detection_dataset_dicts':
                     descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
                 # validation dataset is too large.
+                random.seed(2020)
                 descs_valid = random.choices(descs_valid, k=N_IMAGES_PER_TEST)
                 # TODO: clear cache.
                 dataset = DatasetFromList(descs_valid)
