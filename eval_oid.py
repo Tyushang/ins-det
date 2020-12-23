@@ -153,7 +153,10 @@ if __name__ == "__main__":
         CLI_ARGS = sys.argv[1:]
     else:
         CLI_ARGS = [
-            '--config-file', 'configs-oid/mask_rcnn_R_50_FPN_3x.yaml',
+            # '--config-file', 'configs-oid/mask_rcnn_R_50_FPN_3x.yaml',
+            '--config-file', './output-save/config.yaml',
+            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
+            'MODEL.WEIGHTS', './output-save/model_0017999.pth',
             'MODEL.DEVICE', 'cpu',
             'SOLVER.IMS_PER_BATCH', '4', 'SOLVER.BASE_LR', '0.0025',
             'DATASETS.TRAIN', '("oid_train", )',
@@ -162,7 +165,6 @@ if __name__ == "__main__":
             # 'SOLVER.MAX_ITER', '20_000',
             # INPUT.FORMAT?  INPUT.MASK_FORMAT?
             # '--opts',
-            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
             # 'MODEL.DEVICE', 'cpu'
         ]
     ARGS = default_argument_parser().parse_args(CLI_ARGS)

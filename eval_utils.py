@@ -23,7 +23,7 @@ from detectron2.utils import comm
 from detectron2.utils.logger import create_small_table
 from fvcore.common.file_io import PathManager
 from object_detection.metrics.oid_challenge_evaluation import _load_labelmap
-from object_detection.utils import object_detection_evaluation
+from object_detection.utils import object_detection_evaluation as tfod_evaluation
 from pycocotools.coco import COCO
 from tabulate import tabulate
 
@@ -216,6 +216,7 @@ class MyCocoEvaluator(DatasetEvaluator):
         return results
 
 
+# noinspection PyProtectedMember
 class TfodEvaluator(DatasetEvaluator):
 
     def __init__(self, oid_paths, no_to_mid, distributed=True):
@@ -263,9 +264,10 @@ class TfodEvaluator(DatasetEvaluator):
 
     def process(self, inputs, outputs):
         for inp, out in zip(inputs, outputs):
+            instances = out["instances"].to(self._cpu_device)
             self.all_ptd2_preds.append({
                 "image_id" : inp["image_id"],
-                "instances": out["instances"].to(self._cpu_device)
+                "instances": instances
             })
 
     def evaluate(self):
@@ -279,7 +281,18 @@ class TfodEvaluator(DatasetEvaluator):
                 return {}
         else:
             raw_preds = self.all_ptd2_preds
+
+        # TODO: does removing images with null predictions affect metrics?
+        if 'filter images with predictions.':
+            raw_preds = list(filter(lambda x: len(x['instances']) > 0, raw_preds))
+            if len(raw_preds) == 0:
+                print("_"*60 + "There's no predictions.")
+                return
+
         image_ids = [x['image_id'] for x in raw_preds]
+        all_predictions = ptd2_preds_to_tfod_eval_preds(
+            raw_preds, image_ids=image_ids, no_to_mid=self.no_to_mid)
+
         all_location_annotations = self.gt_bboxes[self.gt_bboxes['ImageID'].isin(image_ids)]
         all_label_annotations    = self.gt_image_labels[self.gt_image_labels['ImageID'].isin(image_ids)]
 
@@ -297,34 +310,59 @@ class TfodEvaluator(DatasetEvaluator):
         all_annotations = pd.concat([all_location_annotations, all_label_annotations])
 
         class_label_map, categories = self.label_map, self.categories
-        challenge_evaluator = (
-            object_detection_evaluation.OpenImagesChallengeEvaluator(
-                categories, evaluate_masks=is_instance_segmentation_eval))
 
-        all_predictions = ptd2_preds_to_tfod_eval_preds(
-            raw_preds, image_ids=image_ids, no_to_mid=self.no_to_mid)
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+        executor = ThreadPoolExecutor(max_workers=os.cpu_count() - 1)
+        func = partial(self.proc_one_image, categories=categories,
+                       class_label_map=class_label_map,
+                       evaluate_masks=is_instance_segmentation_eval)
+        evaluator_list = list(executor.map(func,
+                                           [all_annotations[all_annotations['ImageID'] == x] for x in image_ids],
+                                           [all_predictions[all_predictions['ImageID'] == x] for x in image_ids]))
 
-        images_processed = 0
-        for _, groundtruth in enumerate(all_annotations.groupby('ImageID')):
-            image_id, image_groundtruth = groundtruth
-            groundtruth_dictionary = tfod_utils.build_groundtruth_dictionary(
-                image_groundtruth, class_label_map)
-            challenge_evaluator.add_single_ground_truth_image_info(
-                image_id, groundtruth_dictionary)
-            prediction_dictionary = tfod_utils.build_predictions_dictionary(
-                all_predictions.loc[all_predictions['ImageID'] == image_id],
-                class_label_map)
-            # TODO: this will call compute_object_detection_metrics(), which has high time-consumption.
-            challenge_evaluator.add_single_detected_image_info(image_id,
-                                                               prediction_dictionary)
-            images_processed += 1
+        if 'merge-tfod-evaluator':
+            merged: tfod_evaluation.OpenImagesChallengeEvaluator = evaluator_list[0]
+            for ev in evaluator_list[1:]:
+                for i_class in range(merged._evaluation.num_class):
+                    # merge _evaluation.scores_per_class
+                    merged._evaluation.scores_per_class[i_class].extend(
+                        ev._evaluation.scores_per_class[i_class])
+                    # merge _evaluation.tp_fp_labels_per_class
+                    merged._evaluation.tp_fp_labels_per_class[i_class].extend(
+                        ev._evaluation.tp_fp_labels_per_class[i_class])
+                # merge _evaluation.num_images_correctly_detected_per_class
+                merged._evaluation.num_images_correctly_detected_per_class += \
+                    ev._evaluation.num_images_correctly_detected_per_class
+                # merge _evaluation.num_gt_imgs_per_class
+                merged._evaluation.num_gt_imgs_per_class += \
+                    ev._evaluation.num_gt_imgs_per_class
+                # merge _evaluation.num_gt_instances_per_class
+                merged._evaluation.num_gt_instances_per_class += \
+                    ev._evaluation.num_gt_instances_per_class
 
-        metrics = challenge_evaluator.evaluate()
+        metrics = merged.evaluate()
 
         # with open(FLAGS.output_metrics, 'w') as fid:
         #     io_utils.write_csv(fid, metrics)
 
         return OrderedDict({'instance-segmentation': metrics})
+
+    @staticmethod
+    def proc_one_image(groundtruth, predictions, categories, class_label_map, evaluate_masks):
+        image_id = groundtruth['ImageID'].iloc[0]
+        tfod_evaluator = tfod_evaluation.OpenImagesChallengeEvaluator(
+            categories, evaluate_masks=evaluate_masks
+        )
+        gt_dict = tfod_utils.build_groundtruth_dictionary(groundtruth, class_label_map)
+
+        tfod_evaluator.add_single_ground_truth_image_info(image_id, gt_dict)
+
+        pred_dict = tfod_utils.build_predictions_dictionary(predictions, class_label_map)
+        # TODO: this will call compute_object_detection_metrics(), which has high time-consumption.
+        tfod_evaluator.add_single_detected_image_info(image_id, pred_dict)
+
+        return tfod_evaluator
 
 
 def get_evaluator2(cfg, dataset_name, output_folder=None):
