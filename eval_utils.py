@@ -324,22 +324,24 @@ class TfodEvaluator(DatasetEvaluator):
         if 'merge-tfod-evaluator':
             merged: tfod_evaluation.OpenImagesChallengeEvaluator = evaluator_list[0]
             for ev in evaluator_list[1:]:
-                for i_class in range(merged._evaluation.num_class):
-                    # merge _evaluation.scores_per_class
-                    merged._evaluation.scores_per_class[i_class].extend(
-                        ev._evaluation.scores_per_class[i_class])
-                    # merge _evaluation.tp_fp_labels_per_class
-                    merged._evaluation.tp_fp_labels_per_class[i_class].extend(
-                        ev._evaluation.tp_fp_labels_per_class[i_class])
-                # merge _evaluation.num_images_correctly_detected_per_class
-                merged._evaluation.num_images_correctly_detected_per_class += \
-                    ev._evaluation.num_images_correctly_detected_per_class
-                # merge _evaluation.num_gt_imgs_per_class
-                merged._evaluation.num_gt_imgs_per_class += \
-                    ev._evaluation.num_gt_imgs_per_class
-                # merge _evaluation.num_gt_instances_per_class
-                merged._evaluation.num_gt_instances_per_class += \
-                    ev._evaluation.num_gt_instances_per_class
+                state, ids = ev.get_internal_state()
+                merged.merge_internal_state(ids, state)
+                # for i_class in range(merged._evaluation.num_class):
+                #     # merge _evaluation.scores_per_class
+                #     merged._evaluation.scores_per_class[i_class].extend(
+                #         ev._evaluation.scores_per_class[i_class])
+                #     # merge _evaluation.tp_fp_labels_per_class
+                #     merged._evaluation.tp_fp_labels_per_class[i_class].extend(
+                #         ev._evaluation.tp_fp_labels_per_class[i_class])
+                # # merge _evaluation.num_images_correctly_detected_per_class
+                # merged._evaluation.num_images_correctly_detected_per_class += \
+                #     ev._evaluation.num_images_correctly_detected_per_class
+                # # merge _evaluation.num_gt_imgs_per_class
+                # merged._evaluation.num_gt_imgs_per_class += \
+                #     ev._evaluation.num_gt_imgs_per_class
+                # # merge _evaluation.num_gt_instances_per_class
+                # merged._evaluation.num_gt_instances_per_class += \
+                #     ev._evaluation.num_gt_instances_per_class
 
         metrics = merged.evaluate()
 

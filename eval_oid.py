@@ -75,9 +75,8 @@ def do_test(cfg, model):
             if 'get_detection_dataset_dicts':
                 descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
             # validation dataset is too large.
-            print(descs_valid)
             random.seed(2020)
-            descs_valid = random.choices(descs_valid, k=100)
+            descs_valid = random.sample(descs_valid, k=80)
             dataset = DatasetFromList(descs_valid)
             if 'DatasetMapper':
                 mapper = make_mapper(dataset_name, is_train=False, augmentations=None)
