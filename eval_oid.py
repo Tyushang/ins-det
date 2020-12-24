@@ -165,7 +165,6 @@ if __name__ == "__main__":
             # 'SOLVER.MAX_ITER', '20_000',
             # INPUT.FORMAT?  INPUT.MASK_FORMAT?
             # '--opts',
-            # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
             # 'MODEL.DEVICE', 'cpu'
         ]
     ARGS = default_argument_parser().parse_args(CLI_ARGS)
