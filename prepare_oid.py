@@ -24,7 +24,7 @@ from detectron2.data import transforms as T
 from detectron2.structures import BoxMode, Instances, Boxes, BitMasks
 from tqdm import tqdm
 
-from utils import id_from_path
+from oid_common_utils import id_from_path
 
 # ____________________________ Environment _____________________________________
 RUN_ON = 'local' if platform.node() == 'frank-note' else 'google-cloud'

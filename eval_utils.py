@@ -9,7 +9,9 @@ import itertools
 import json
 import logging
 import os
-from datetime import datetime
+from functools import partial
+from multiprocessing import Pool
+from multiprocessing import Queue
 from typing import *
 
 import numpy as np
@@ -22,22 +24,22 @@ from detectron2.evaluation.coco_evaluation import instances_to_coco_json, _evalu
 from detectron2.utils import comm
 from detectron2.utils.logger import create_small_table
 from fvcore.common.file_io import PathManager
+from memory_profiler import profile
 from object_detection.metrics.oid_challenge_evaluation import _load_labelmap
 from object_detection.utils import object_detection_evaluation as tfod_evaluation
 from pycocotools.coco import COCO
 from tabulate import tabulate
 
 from object_detection.metrics import oid_challenge_evaluation_utils as tfod_utils
+from tqdm import tqdm
 
-# noinspection PyMethodMayBeStatic,PyAttributeOutsideInit
 from prepare_oid import NO_TO_MID, get_paths, OID_DIR, MASK_THRESHOLD
-from utils import encode_binary_mask, encode_mask_from_path
+from oid_common_utils import encode_binary_mask, encode_mask_from_path
 
 
 logger = logging.getLogger('detectron2')
 
 
-# noinspection PyPep8Naming,PyMethodMayBeStatic,PyAttributeOutsideInit
 class MyCocoEvaluator(DatasetEvaluator):
 
     def __init__(self, dataset_name, cfg, distributed, output_dir=None, *, use_fast_impl=True):
@@ -216,10 +218,9 @@ class MyCocoEvaluator(DatasetEvaluator):
         return results
 
 
-# noinspection PyProtectedMember
 class TfodEvaluator(DatasetEvaluator):
 
-    def __init__(self, oid_paths, no_to_mid, distributed=True):
+    def __init__(self, oid_paths, no_to_mid, distributed=True, pred_q=None):
         self.logger       = logging.getLogger('TfodEvaluator')
         self._cpu_device  = torch.device("cpu")
         self._distributed = distributed
@@ -235,6 +236,7 @@ class TfodEvaluator(DatasetEvaluator):
 
         # detectron2 predictions with "image_id" key.
         self.all_ptd2_preds  = []
+        self.queue = pred_q
 
     def get_gt_masks(self):
         # use cache file to accelerate.
@@ -265,24 +267,31 @@ class TfodEvaluator(DatasetEvaluator):
     def process(self, inputs, outputs):
         for inp, out in zip(inputs, outputs):
             instances = out["instances"].to(self._cpu_device)
-            self.all_ptd2_preds.append({
+            # self.all_ptd2_preds.append({
+            #     "image_id" : inp["image_id"],
+            #     "instances": instances
+            # })
+            self.queue.put({
                 "image_id" : inp["image_id"],
                 "instances": instances
             })
 
     def evaluate(self):
-        if 'self._distributed':
-            # TODO: error raised when there's no predictions!
-            comm.synchronize()
-            raw_preds = comm.gather(self.all_ptd2_preds, dst=0)
-            raw_preds = list(itertools.chain(*raw_preds))
-
-            if not comm.is_main_process():
+        if self._distributed:
+            if comm.is_main_process():
+                raw_preds = []
+                while not self.queue.empty():
+                    raw_preds.append(self.queue.get())
+                pass
+            else:
                 return {}
+
+            # comm.synchronize()
+            # raw_preds = comm.gather(self.all_ptd2_preds, dst=0)
+            # raw_preds = list(itertools.chain(*raw_preds))
         else:
             raw_preds = self.all_ptd2_preds
 
-        # TODO: does removing images with null predictions affect metrics?
         if 'filter images with predictions.':
             raw_preds = list(filter(lambda x: len(x['instances']) > 0, raw_preds))
             if len(raw_preds) == 0:
@@ -311,37 +320,17 @@ class TfodEvaluator(DatasetEvaluator):
 
         class_label_map, categories = self.label_map, self.categories
 
-        from concurrent.futures import ThreadPoolExecutor
-        from functools import partial
-        executor = ThreadPoolExecutor(max_workers=os.cpu_count() - 1)
+        pool = Pool()
         func = partial(self.proc_one_image, categories=categories,
                        class_label_map=class_label_map,
                        evaluate_masks=is_instance_segmentation_eval)
-        evaluator_list = list(executor.map(func,
-                                           [all_annotations[all_annotations['ImageID'] == x] for x in image_ids],
-                                           [all_predictions[all_predictions['ImageID'] == x] for x in image_ids]))
-
+        itr  = zip([all_annotations[all_annotations['ImageID'] == x] for x in image_ids],
+                   [all_predictions[all_predictions['ImageID'] == x] for x in image_ids])
+        state_and_ids_list = list(tqdm(pool.imap(func, itr)))
         if 'merge-tfod-evaluator':
-            merged: tfod_evaluation.OpenImagesChallengeEvaluator = evaluator_list[0]
-            for ev in evaluator_list[1:]:
-                state, ids = ev.get_internal_state()
+            merged = tfod_evaluation.OpenImagesChallengeEvaluator(categories, is_instance_segmentation_eval)
+            for state, ids in state_and_ids_list:
                 merged.merge_internal_state(ids, state)
-                # for i_class in range(merged._evaluation.num_class):
-                #     # merge _evaluation.scores_per_class
-                #     merged._evaluation.scores_per_class[i_class].extend(
-                #         ev._evaluation.scores_per_class[i_class])
-                #     # merge _evaluation.tp_fp_labels_per_class
-                #     merged._evaluation.tp_fp_labels_per_class[i_class].extend(
-                #         ev._evaluation.tp_fp_labels_per_class[i_class])
-                # # merge _evaluation.num_images_correctly_detected_per_class
-                # merged._evaluation.num_images_correctly_detected_per_class += \
-                #     ev._evaluation.num_images_correctly_detected_per_class
-                # # merge _evaluation.num_gt_imgs_per_class
-                # merged._evaluation.num_gt_imgs_per_class += \
-                #     ev._evaluation.num_gt_imgs_per_class
-                # # merge _evaluation.num_gt_instances_per_class
-                # merged._evaluation.num_gt_instances_per_class += \
-                #     ev._evaluation.num_gt_instances_per_class
 
         metrics = merged.evaluate()
 
@@ -351,20 +340,23 @@ class TfodEvaluator(DatasetEvaluator):
         return OrderedDict({'instance-segmentation': metrics})
 
     @staticmethod
-    def proc_one_image(groundtruth, predictions, categories, class_label_map, evaluate_masks):
+    def proc_one_image(gt_and_preds, categories, class_label_map, evaluate_masks):
+        groundtruth, predictions = gt_and_preds
         image_id = groundtruth['ImageID'].iloc[0]
-        tfod_evaluator = tfod_evaluation.OpenImagesChallengeEvaluator(
-            categories, evaluate_masks=evaluate_masks
-        )
-        gt_dict = tfod_utils.build_groundtruth_dictionary(groundtruth, class_label_map)
 
+        tfod_evaluator = tfod_evaluation.OpenImagesChallengeEvaluator(categories, evaluate_masks=evaluate_masks)
+
+        gt_dict = tfod_utils.build_groundtruth_dictionary(groundtruth, class_label_map)
         tfod_evaluator.add_single_ground_truth_image_info(image_id, gt_dict)
 
         pred_dict = tfod_utils.build_predictions_dictionary(predictions, class_label_map)
-        # TODO: this will call compute_object_detection_metrics(), which has high time-consumption.
         tfod_evaluator.add_single_detected_image_info(image_id, pred_dict)
 
-        return tfod_evaluator
+        return tfod_evaluator.get_internal_state()
+
+
+PRED_Q = Queue()
+TFOD_EVALUATOR = None
 
 
 def get_evaluator2(cfg, dataset_name, output_folder=None):
@@ -377,8 +369,11 @@ def get_evaluator2(cfg, dataset_name, output_folder=None):
     if evaluator_type == 'oid':
         evaluator_list.append(MyCocoEvaluator(dataset_name, cfg, True, output_folder))
     if evaluator_type == 'tfod':
-        paths = get_paths(OID_DIR, 'validation')
-        evaluator_list.append(TfodEvaluator(paths, MetadataCatalog.get(dataset_name).no_to_mid, distributed=True))
+        global TFOD_EVALUATOR
+        if TFOD_EVALUATOR is None:
+            paths = get_paths(OID_DIR, 'validation')
+            TFOD_EVALUATOR = TfodEvaluator(paths, MetadataCatalog.get(dataset_name).no_to_mid, distributed=True, pred_q=PRED_Q)
+        evaluator_list.append(TFOD_EVALUATOR)
 
     if len(evaluator_list) == 1:
         return evaluator_list[0]
@@ -418,44 +413,6 @@ def ptd2_preds_to_tfod_eval_preds(preds, image_ids, no_to_mid=NO_TO_MID):
                 'Mask'       : encode_binary_mask(mask.numpy()),
                 'LabelName'  : no_to_mid[int(klass)],
             })
-
-    return pd.DataFrame.from_records(pred_dicts)
-
-
-def ptd2_preds_to_kaggle_eval_preds(preds, image_ids, no_to_mid=NO_TO_MID):
-    """
-    - Model(ptd2 maskrcnn) Output Format
-        @see ptd2_preds_to_tfod_eval_preds
-    - kaggle evaluation prediction csv format
-        | ImageID | ImageWidth | ImageHeight | PredictionString |
-        where PredictionString is: LabelA1 ConfidenceA1 EncodedMaskA1 LabelA2 ConfidenceA2 EncodedMaskA2 ...
-        注：ImageID is unique key.
-    @param preds:
-    @param image_ids:
-    @param no_to_mid:
-    @return:
-    """
-    def _ins_to_string(klass, score, mask):
-        """Convert one instance to prediction string."""
-        mid          = no_to_mid[int(klass)]
-        confidence   = float(score)
-        encoded_mask = encode_binary_mask(mask.numpy())
-        return f"{mid} {confidence} {encoded_mask}"
-
-    pred_dicts = []
-    instances_list = [p['instances'] for p in preds]
-    for image_id, ins in zip(image_ids, instances_list):  # foreach image instances:
-        origin_image_height, origin_image_width = ins.image_size
-        prediction_string = " ".join(
-            list(map(_ins_to_string, ins.pred_classes, ins.scores, ins.pred_masks))
-        )
-
-        pred_dicts.append({
-            'ImageID'         : image_id,
-            'ImageWidth'      : origin_image_width,
-            'ImageHeight'     : origin_image_height,
-            'PredictionString': prediction_string,
-        })
 
     return pd.DataFrame.from_records(pred_dicts)
 

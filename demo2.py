@@ -109,7 +109,7 @@ if __name__ == "__main__":
     predictor = DefaultPredictor(cfg)
     model     = predictor.model
 
-    INP_TYPE = 'dataloader'  # or dataloader
+    INP_TYPE = 'manual'  # or dataloader
     if INP_TYPE == 'manual':
         pred_all = []
         for path in args.input:
@@ -120,28 +120,28 @@ if __name__ == "__main__":
                 # here: image shape should be [C, H, W], and BGR format
                 img = torch.as_tensor(img.astype("float32").transpose(2, 0, 1))
 
-                inputs = {"image": img, "height": height, "width": width}
+                inputs = {"image_id": "123", "image": img, "height": height, "width": width}
                 pred = predictor.model([inputs])[0]
                 # {'instances': detectron2.structures.instances.Instances}
                 pred_all.append(pred)
 
-                visualizer = Visualizer(raw_image[:, :, ::-1])
-                # noinspection DuplicatedCode
-                if "panoptic_seg" in pred:
-                    ...
-                else:
-                    if "sem_seg" in pred:
-                        pred_vis = visualizer.draw_sem_seg(
-                            pred["sem_seg"].argmax(dim=0).to(torch.device("cpu"))
-                        )
-                    if "instances" in pred:
-                        instances = pred["instances"].to(torch.device("cpu"))
-                        pred_vis = visualizer.draw_instance_predictions(predictions=instances)
-
-                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-                cv2.imshow(WINDOW_NAME, pred_vis.get_image()[:, :, ::-1])
-                if cv2.waitKey(delay=5) == 27:
-                    break  # esc to quit
+                # visualizer = Visualizer(raw_image[:, :, ::-1])
+                # # noinspection DuplicatedCode
+                # if "panoptic_seg" in pred:
+                #     ...
+                # else:
+                #     if "sem_seg" in pred:
+                #         pred_vis = visualizer.draw_sem_seg(
+                #             pred["sem_seg"].argmax(dim=0).to(torch.device("cpu"))
+                #         )
+                #     if "instances" in pred:
+                #         instances = pred["instances"].to(torch.device("cpu"))
+                #         pred_vis = visualizer.draw_instance_predictions(predictions=instances)
+                #
+                # cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                # cv2.imshow(WINDOW_NAME, pred_vis.get_image()[:, :, ::-1])
+                # if cv2.waitKey(delay=5) == 27:
+                #     break  # esc to quit
 
     elif INP_TYPE == 'dataloader':
         dataset_name = 'coco_2017_val'

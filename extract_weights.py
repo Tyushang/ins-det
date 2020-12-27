@@ -68,7 +68,7 @@ if __name__ == "__main__":
     #     )
 
     if 'extract_weights_without_roi_heads':
-        with open(cfg.MODEL.WEIGHTS, 'rb') as f:
+        with open(cfg.MODEL.WEIGHTS_PATH, 'rb') as f:
             ckpt = pickle.load(f, encoding='latin1')
 
         weight_names = deepcopy(list(ckpt["model"].keys()))
@@ -76,7 +76,7 @@ if __name__ == "__main__":
             if k.startswith('roi_heads'):
                 ckpt["model"].pop(k)
 
-        save_path = cfg.MODEL.WEIGHTS.replace('.pkl', '_without_roi_heads.pkl')
+        save_path = cfg.MODEL.WEIGHTS_PATH.replace('.pkl', '_without_roi_heads.pkl')
         with PathManager.open(save_path, "wb") as f:
             pickle.dump(ckpt, f)
 

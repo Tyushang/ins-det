@@ -76,7 +76,7 @@ def do_test(cfg, model):
                 descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
             # validation dataset is too large.
             random.seed(2020)
-            descs_valid = random.sample(descs_valid, k=80)
+            descs_valid = random.sample(descs_valid, k=10)
             dataset = DatasetFromList(descs_valid)
             if 'DatasetMapper':
                 mapper = make_mapper(dataset_name, is_train=False, augmentations=None)
@@ -111,6 +111,7 @@ def do_test(cfg, model):
                     RES = res
                     res_df = pd.DataFrame(pd.Series(res, name='value'))
                     res_df = res_df[res_df['value'].notna()]
+                    # res_df = res_df[res_df['value'] > 0]
                     res_df.index = res_df.index.map(lambda x: '/'.join(x.split('/')[1:]))
                     pd.set_option('display.max_rows', None)
                     print(res_df)
@@ -142,8 +143,8 @@ def main(args):
     # mem_stats_df.record('After-Build-Model')
 
     if 'evaluation':
-        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=args.resume
+        checkpoint = DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS_PATH, resume=args.resume
         )
         do_test(cfg, model)
 
