@@ -9,6 +9,7 @@ import itertools
 import json
 import logging
 import os
+import random
 from functools import partial
 from multiprocessing import Pool
 from multiprocessing import Queue
@@ -220,7 +221,7 @@ class MyCocoEvaluator(DatasetEvaluator):
 
 class TfodEvaluator(DatasetEvaluator):
 
-    def __init__(self, oid_paths, no_to_mid, distributed=True, pred_q=None):
+    def __init__(self, oid_paths, no_to_mid, distributed=True):
         self.logger       = logging.getLogger('TfodEvaluator')
         self._cpu_device  = torch.device("cpu")
         self._distributed = distributed
@@ -235,8 +236,9 @@ class TfodEvaluator(DatasetEvaluator):
         self.gt_masks        = self.get_gt_masks()
 
         # detectron2 predictions with "image_id" key.
-        self.all_ptd2_preds  = []
-        self.queue = pred_q
+        self.n_shards           = 0x10
+        self.all_ptd2_preds     = dict((sid, []) for sid in range(self.n_shards))
+        self.state_and_ids_list = []
 
     def get_gt_masks(self):
         # use cache file to accelerate.
@@ -262,82 +264,84 @@ class TfodEvaluator(DatasetEvaluator):
         return joined
 
     def reset(self):
-        self.all_ptd2_preds = []
+        self.all_ptd2_preds     = dict((sid, []) for sid in range(self.n_shards))
 
     def process(self, inputs, outputs):
         for inp, out in zip(inputs, outputs):
             instances = out["instances"].to(self._cpu_device)
-            # self.all_ptd2_preds.append({
-            #     "image_id" : inp["image_id"],
-            #     "instances": instances
-            # })
-            self.queue.put({
+            sid       = random.randint(0, self.n_shards - 1)
+            self.all_ptd2_preds[sid].append({
                 "image_id" : inp["image_id"],
                 "instances": instances
             })
 
     def evaluate(self):
         if self._distributed:
-            if comm.is_main_process():
-                raw_preds = []
-                while not self.queue.empty():
-                    raw_preds.append(self.queue.get())
-                pass
-            else:
+
+            from datetime import datetime
+            tic = datetime.now()
+
+            raw_preds = []
+            for sid in self.all_ptd2_preds.keys():
+                comm.synchronize()
+                shard = comm.gather(self.all_ptd2_preds[sid], dst=0)
+                raw_preds.extend(list(itertools.chain(*shard)))
+            if not comm.is_main_process():
                 return {}
-
-            # comm.synchronize()
-            # raw_preds = comm.gather(self.all_ptd2_preds, dst=0)
-            # raw_preds = list(itertools.chain(*raw_preds))
+            print('>' * 30 + f'gather cost: {(datetime.now() - tic).total_seconds()}s')
         else:
-            raw_preds = self.all_ptd2_preds
+            # raw_preds = self.all_ptd2_preds
+            pass
 
-        if 'filter images with predictions.':
-            raw_preds = list(filter(lambda x: len(x['instances']) > 0, raw_preds))
-            if len(raw_preds) == 0:
-                print("_"*60 + "There's no predictions.")
-                return
+        print('>'*30 + f'raw preds len: {len(raw_preds)}')
+        # import pickle
+        # with open(f'tfod-eval/raw_preds_{comm.get_rank()}.pkl', 'wb') as fid:
+        #     pickle.dump(raw_preds, fid)
 
-        image_ids = [x['image_id'] for x in raw_preds]
-        all_predictions = ptd2_preds_to_tfod_eval_preds(
-            raw_preds, image_ids=image_ids, no_to_mid=self.no_to_mid)
-
-        all_location_annotations = self.gt_bboxes[self.gt_bboxes['ImageID'].isin(image_ids)]
-        all_label_annotations    = self.gt_image_labels[self.gt_image_labels['ImageID'].isin(image_ids)]
-
-        is_instance_segmentation_eval = True
-        if 'instance-segmentation-task':
-            all_segm_annotations = self.gt_masks[self.gt_masks['ImageID'].isin(image_ids)]
-            # Note: this part is unstable as it requires the float point numbers in both
-            # csvs are exactly the same;
-            # Will be replaced by more stable solution: merge on LabelName and ImageID
-            # and filter down by IoU.
-            all_location_annotations = pd.merge(all_location_annotations, all_segm_annotations,
-                                                how='outer',
-                                                on=['LabelName', 'ImageID', 'XMin', 'XMax', 'YMin', 'YMax',])
-
-        all_annotations = pd.concat([all_location_annotations, all_label_annotations])
-
-        class_label_map, categories = self.label_map, self.categories
-
-        pool = Pool()
-        func = partial(self.proc_one_image, categories=categories,
-                       class_label_map=class_label_map,
-                       evaluate_masks=is_instance_segmentation_eval)
-        itr  = zip([all_annotations[all_annotations['ImageID'] == x] for x in image_ids],
-                   [all_predictions[all_predictions['ImageID'] == x] for x in image_ids])
-        state_and_ids_list = list(tqdm(pool.imap(func, itr)))
-        if 'merge-tfod-evaluator':
-            merged = tfod_evaluation.OpenImagesChallengeEvaluator(categories, is_instance_segmentation_eval)
-            for state, ids in state_and_ids_list:
-                merged.merge_internal_state(ids, state)
-
-        metrics = merged.evaluate()
-
-        # with open(FLAGS.output_metrics, 'w') as fid:
-        #     io_utils.write_csv(fid, metrics)
-
-        return OrderedDict({'instance-segmentation': metrics})
+        # if 'filter images with predictions.':
+        #     raw_preds = list(filter(lambda x: len(x['instances']) > 0, raw_preds))
+        #     if len(raw_preds) == 0:
+        #         print("_"*60 + "There's no predictions.")
+        #         return
+        #
+        # image_ids = [x['image_id'] for x in raw_preds]
+        # all_predictions = ptd2_preds_to_tfod_eval_preds(
+        #     raw_preds, image_ids=image_ids, no_to_mid=self.no_to_mid)
+        #
+        # all_location_annotations = self.gt_bboxes[self.gt_bboxes['ImageID'].isin(image_ids)]
+        # all_label_annotations    = self.gt_image_labels[self.gt_image_labels['ImageID'].isin(image_ids)]
+        #
+        # is_instance_segmentation_eval = True
+        # if 'instance-segmentation-task':
+        #     all_segm_annotations = self.gt_masks[self.gt_masks['ImageID'].isin(image_ids)]
+        #     # Note: this part is unstable as it requires the float point numbers in both
+        #     # csvs are exactly the same;
+        #     # Will be replaced by more stable solution: merge on LabelName and ImageID
+        #     # and filter down by IoU.
+        #     all_location_annotations = pd.merge(all_location_annotations, all_segm_annotations,
+        #                                         how='outer',
+        #                                         on=['LabelName', 'ImageID', 'XMin', 'XMax', 'YMin', 'YMax',])
+        #
+        # all_annotations = pd.concat([all_location_annotations, all_label_annotations])
+        #
+        # class_label_map, categories = self.label_map, self.categories
+        #
+        # pool = Pool(int(os.cpu_count() - torch.cuda.device_count()) - 1)
+        # func = partial(self.proc_one_image, categories=categories,
+        #                class_label_map=class_label_map,
+        #                evaluate_masks=is_instance_segmentation_eval)
+        # itr  = zip([all_annotations[all_annotations['ImageID'] == x] for x in image_ids],
+        #            [all_predictions[all_predictions['ImageID'] == x] for x in image_ids])
+        # state_and_ids_list = list(tqdm(pool.imap(func, itr)))
+        # if 'merge-tfod-evaluator':
+        #     merged = tfod_evaluation.OpenImagesChallengeEvaluator(categories, is_instance_segmentation_eval)
+        #     for state, ids in state_and_ids_list:
+        #         merged.merge_internal_state(ids, state)
+        #
+        # self.state_and_ids_list.append(merged.get_internal_state())
+        # return {}
+        # # metrics = merged.evaluate()
+        # # return OrderedDict({'instance-segmentation': metrics})
 
     @staticmethod
     def proc_one_image(gt_and_preds, categories, class_label_map, evaluate_masks):
@@ -355,7 +359,6 @@ class TfodEvaluator(DatasetEvaluator):
         return tfod_evaluator.get_internal_state()
 
 
-PRED_Q = Queue()
 TFOD_EVALUATOR = None
 
 
@@ -372,7 +375,7 @@ def get_evaluator2(cfg, dataset_name, output_folder=None):
         global TFOD_EVALUATOR
         if TFOD_EVALUATOR is None:
             paths = get_paths(OID_DIR, 'validation')
-            TFOD_EVALUATOR = TfodEvaluator(paths, MetadataCatalog.get(dataset_name).no_to_mid, distributed=True, pred_q=PRED_Q)
+            TFOD_EVALUATOR = TfodEvaluator(paths, MetadataCatalog.get(dataset_name).no_to_mid, distributed=True)
         evaluator_list.append(TFOD_EVALUATOR)
 
     if len(evaluator_list) == 1:

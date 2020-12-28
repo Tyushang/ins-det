@@ -74,7 +74,7 @@ BATCH_SIZE  = N_GPUS * IMS_PER_GPU
 N_EPOCHS = 1
 N_STEPS  = (N_IMAGES_TRAIN * N_EPOCHS) // BATCH_SIZE
 
-N_IMAGES_PER_TEST = 500
+N_IMAGES_PER_TEST = 800
 
 MILESTONES_RATIO = (0.77, 0.92)
 MILESTONES       = tuple([int(m * N_STEPS) for m in MILESTONES_RATIO])
@@ -166,27 +166,31 @@ def do_test(cfg, model):
         evaluator = get_evaluator2(
             cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
         )
-        print('=' * 30 + f'do_test(), pid: {os.getpid()}, data_loader: {data_loader}')
-        print('=' * 30 + f'do_test(), pid: {os.getpid()},  evaluator: {evaluator}')
 
         results_i = inference_on_dataset(model, data_loader, evaluator)
-        del descs_get, descs_valid, ds_valid,  data_loader
-        gc.collect()
-        # TODO: Multiprocessing? Why so slow in gcloud.
-        print('_'*30 + 'if comm.is_main_process():')
-        if comm.is_main_process():
-            logger.info("Evaluation results for {} in csv format:".format(dataset_name))
-            # print_csv_format(results_i)
-            for tsk, res in results_i.items():
-                res_df = pd.DataFrame(pd.Series(res, name='value'))
-                res_df = res_df[res_df['value'].notna()]
-                # res_df = res_df[res_df['value'] > 0]
-                res_df.index = res_df.index.map(lambda x: '/'.join(x.split('/')[1:]))
-                pd.set_option('display.max_rows', None)
-                print(res_df)
-                pd.reset_option('display.max_rows')
-
-        comm.synchronize()
+        # torch.cuda.empty_cache()
+        # if comm.is_main_process():
+        #     comm.synchronize()
+        #     state_and_ids_list = comm.gather(evaluator.state_and_ids_list, dst=0)
+        #
+        #     from object_detection.utils import object_detection_evaluation as tfod_evaluation
+        #     merged = tfod_evaluation.OpenImagesChallengeEvaluator(evaluator, True)
+        #     for state, ids in state_and_ids_list:
+        #         merged.merge_internal_state(ids, state)
+        #
+        #     metrics = merged.evaluate()
+        #     results_i = OrderedDict({'instance-segmentation': metrics})
+        #
+        #     logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+        #     # print_csv_format(results_i)
+        #     for tsk, res in results_i.items():
+        #         res_df = pd.DataFrame(pd.Series(res, name='value'))
+        #         res_df = res_df[res_df['value'].notna()]
+        #         # res_df = res_df[res_df['value'] > 0]
+        #         res_df.index = res_df.index.map(lambda x: '/'.join(x.split('/')[1:]))
+        #         pd.set_option('display.max_rows', None)
+        #         print(res_df)
+        #         pd.reset_option('display.max_rows')
 
 
 def main(args):
@@ -316,7 +320,7 @@ def main(args):
                     ):
                         do_test(cfg, model)
                         # Compared to "train_net.py", the test results are not dumped to EventStorage
-                        # comm.synchronize()
+                        comm.synchronize()
 
                     if iteration - start_iter > 5 and (iteration % 100 == 0 or iteration == max_iter):
                         for writer in writers:
