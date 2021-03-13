@@ -23,6 +23,8 @@ from detectron2.engine import DefaultPredictor
 from detectron2.utils.visualizer import Visualizer
 
 # constants
+from torch.utils.data import RandomSampler
+
 from prepare_oid import make_mapper
 
 WINDOW_NAME = "COCO detections"
@@ -92,7 +94,7 @@ if __name__ == "__main__":
         '--input', './sample_images/input1.jpg', './sample_images/input2.jpg',
         '--opts',
         # 'MODEL.WEIGHTS', './weights/model_final_f10217.pkl',
-        'MODEL.WEIGHTS', './output-save/model_0017999.pth',
+        'MODEL.WEIGHTS', './output-save/model_final.pth',
         'MODEL.DEVICE', 'cpu'
     ]
 
@@ -109,7 +111,7 @@ if __name__ == "__main__":
     predictor = DefaultPredictor(cfg)
     model     = predictor.model
 
-    INP_TYPE = 'manual'  # or dataloader
+    INP_TYPE = 'dataloader'  # or dataloader
     if INP_TYPE == 'manual':
         pred_all = []
         for path in args.input:
@@ -154,16 +156,15 @@ if __name__ == "__main__":
         else:  # Open-Image-Dataset
             if 'get_detection_dataset_dicts':
                 descs_valid: List[Dict] = DatasetCatalog.get(dataset_name)
-            # validation dataset is too large.
-            descs_valid = random.choices(descs_valid, k=200)
-            # TODO: clear cache.
+            # # validation dataset is too large.
+            # descs_valid = random.choices(descs_valid, k=200)
             dataset = DatasetFromList(descs_valid)
             if 'DatasetMapper':
                 mapper = make_mapper(dataset_name, is_train=False, augmentations=None)
 
         dataset = MapDataset(dataset, mapper)
 
-        sampler = InferenceSampler(len(dataset))
+        sampler = RandomSampler(dataset)
         # Always use 1 image per worker during inference since this is the
         # standard when reporting inference time in papers.
         batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, 1, drop_last=False)
@@ -189,7 +190,7 @@ if __name__ == "__main__":
                 pred_all = predictor.model([inputs])
                 # {'instances': detectron2.structures.instances.Instances}
                 pred = pred_all[0]
-                print(pred)
+                print(f'Num Preds: {len(pred["instances"])}')
 
             visualizer = Visualizer(raw_image[:, :, ::-1])
             # noinspection DuplicatedCode

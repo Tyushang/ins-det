@@ -10,7 +10,9 @@ import os
 import pickle
 import platform
 from functools import partial
+from math import ceil
 from multiprocessing import Pool
+from random import shuffle
 from typing import *
 
 import numpy as np
@@ -45,8 +47,8 @@ def get_paths(oid_root, tvt):
     ROOT:
     |-- annotation-instance-segmentation
     |   |-- metadata
-    |   |   |-- challenge-2019-classes-description-segmentable.csv      # class_csv      for short.
-    |   |   |-- challenge-2019-label300-segmentable-hierarchy.json      # hierarchy_json for short.
+    |   |   |-- challenge-2019-classes-description-segmentable.csv      # class_csv       for short.
+    |   |   |-- challenge-2019-label300-segmentable-hierarchy.json      # hier_json       for short.
     |   |   |-- oid_object_detection_challenge_500_label_map.pbtxt      # label_map_pbtxt for short. oid_challenge_evaluation need it.
     |   |-- train
     |   |   |-- cache
@@ -101,12 +103,15 @@ def get_paths(oid_root, tvt):
     })
 
 
-if not os.path.exists(get_paths(OID_DIR, 'train').cache):
-    os.makedirs(get_paths(OID_DIR, 'train').cache, exist_ok=True)
-if not os.path.exists(get_paths(OID_DIR, 'validation').cache):
-    os.makedirs(get_paths(OID_DIR, 'validation').cache, exist_ok=True)
+OID_TRAIN_PATHS      = get_paths(OID_DIR, 'train')
+OID_VALIDATION_PATHS = get_paths(OID_DIR, 'validation')
 
-klass_df    = pd.read_csv(get_paths(OID_DIR, 'train').klass_csv, names=['MID', 'name'])\
+if not os.path.exists(OID_TRAIN_PATHS.cache):
+    os.makedirs(OID_TRAIN_PATHS.cache, exist_ok=True)
+if not os.path.exists(OID_VALIDATION_PATHS.cache):
+    os.makedirs(OID_VALIDATION_PATHS.cache, exist_ok=True)
+
+klass_df    = pd.read_csv(OID_TRAIN_PATHS.klass_csv, names=['MID', 'name'])\
               .rename_axis(index='No').reset_index()
 MID_TO_NO   = klass_df.set_index('MID')['No'].to_dict()
 NO_TO_MID   = klass_df.set_index('No')['MID'].to_dict()
@@ -280,6 +285,38 @@ def to_oid_desc(image_id_and_group_df):
             'height'     : origin_height,      # height / width are implied by image files.
             'width'      : origin_width,       # height / width are implied by image files.
             'annotations': annotations}
+
+
+def sample_image_ids():
+    # columns: ['ImageID', 'MaskPath', 'LabelName',    'BoxID', 'BoxXMin', 'BoxXMax',
+    #           'BoxYMin', 'BoxYMax',  'PredictedIoU', 'Clicks', 'Height', 'Width']
+    joined = pd.read_csv(OID_TRAIN_PATHS.joined_csv, usecols=['ImageID', 'LabelName', 'Height', 'Width'])
+
+    if 'filter-images-with-height-and-width<=1024':
+        joined = joined[(joined['Height'] <= 1024) & (joined['Width'] <= 1024)]
+
+    sampled_image_ids = []
+    for _, group_df in joined.groupby('LabelName'):
+        # | Group | Class No.    | original num of imgs per class | rebalancing                   |
+        # |     1 | #241 to #274 | 150-13                         | oversample x10                |
+        # |     2 | #64  to #240 | 1500-150                       | oversample to 1500 imgs/class |
+        # |     3 | #24  to #63  | 6k-1500                        | no rebalancing                |
+        # |     4 | #0   to #23  | 89k-6k                         | downsample to 6k*             |
+        count = len(group_df)
+        if count > 5000:
+            sampled_image_ids.extend(group_df['ImageID'].sample(5000).to_list())
+        elif count > 2000:
+            sampled_image_ids.extend(group_df['ImageID'].to_list())
+        elif count > 200:
+            multiples = ceil(2000 / count)
+            sampled_image_ids.extend(group_df['ImageID'].to_list() * multiples)
+        elif count > 100:
+            sampled_image_ids.extend(group_df['ImageID'].to_list() * 10)
+        else:
+            sampled_image_ids.extend(group_df['ImageID'].to_list() * 20)
+
+    shuffle(sampled_image_ids)
+    return sampled_image_ids
 
 
 def oid_descs_to_detectron2_dicts(descs, masks_dir, cache_path=None):

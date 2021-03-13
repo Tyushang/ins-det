@@ -2,57 +2,35 @@
 # -*- coding: utf-8 -*-
 
 # __author__="Frank Jing"
-import contextlib
-import copy
 import datetime
-import gc
-import io
-import itertools
-import json
 import logging
 import os
-import random
-import socket
-import sys
-import pickle
 import platform
+import random
+import sys
 from typing import *
 
-import numpy as np
 import pandas as pd
-from cv2 import cv2
-
 import torch
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import DatasetCatalog, MetadataCatalog, DatasetFromList, MapDataset, build_batch_data_loader, \
-    DatasetMapper, build_detection_test_loader
+from detectron2.data import DatasetCatalog, DatasetFromList, MapDataset, build_batch_data_loader, \
+    DatasetMapper
+from detectron2.data import transforms as T
 from detectron2.data.build import trivial_batch_collator
-from detectron2.data.datasets.coco import convert_to_coco_json
 from detectron2.data.detection_utils import build_augmentation
 from detectron2.data.samplers import TrainingSampler, InferenceSampler
+from detectron2.data.transforms import RandomContrast, RandomBrightness, RandomSaturation
 from detectron2.engine import default_argument_parser, default_setup, PeriodicCheckpointer, launch
-from detectron2.evaluation import inference_on_dataset, print_csv_format, SemSegEvaluator, COCOEvaluator, \
-    COCOPanopticEvaluator, CityscapesInstanceEvaluator, CityscapesSemSegEvaluator, PascalVOCDetectionEvaluator, \
-    LVISEvaluator, DatasetEvaluators, DatasetEvaluator
-from detectron2.evaluation.coco_evaluation import instances_to_coco_json, _evaluate_predictions_on_coco
+from detectron2.evaluation import inference_on_dataset
 from detectron2.modeling import META_ARCH_REGISTRY
 from detectron2.solver import build_optimizer, build_lr_scheduler
-from detectron2.structures import BoxMode, Instances, Boxes, BitMasks
-from detectron2.data import detection_utils
 from detectron2.utils import comm
 from detectron2.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter, EventStorage
-from detectron2.data import transforms as T
-from detectron2.utils.logger import create_small_table
-from fvcore.common.file_io import PathManager
-from memory_profiler import profile
-from pycocotools.coco import COCO
-from tabulate import tabulate
 from torch.nn.parallel import DistributedDataParallel
-from tqdm import tqdm
 
-from eval_utils import MyCocoEvaluator, get_evaluator2
-from prepare_oid import make_mapper
+from eval_utils import get_evaluator2
+from prepare_oid import make_mapper, sample_image_ids
 
 # ____________________________ Build Environment _______________________________
 RUN_ON = 'local' if platform.node() == 'frank-note' \
@@ -66,7 +44,9 @@ else:
 
 # ____________________________ Config __________________________________________
 N_GPUS  = torch.cuda.device_count()
-N_IMAGES_TRAIN = 847_997
+# N_IMAGES_TRAIN = 847_997  # epoch 1
+# N_IMAGES_TRAIN = 815_209  # epoch 2
+N_IMAGES_TRAIN = 867_193  # epoch 3
 
 IMS_PER_GPU = 4
 BATCH_SIZE  = N_GPUS * IMS_PER_GPU
@@ -74,7 +54,7 @@ BATCH_SIZE  = N_GPUS * IMS_PER_GPU
 N_EPOCHS = 1
 N_STEPS  = (N_IMAGES_TRAIN * N_EPOCHS) // BATCH_SIZE
 
-N_IMAGES_PER_TEST = 800
+N_IMAGES_PER_TEST = 4000
 
 MILESTONES_RATIO = (0.77, 0.92)
 MILESTONES       = tuple([int(m * N_STEPS) for m in MILESTONES_RATIO])
@@ -82,8 +62,7 @@ MILESTONES       = tuple([int(m * N_STEPS) for m in MILESTONES_RATIO])
 DS_TYPE = 'oid'  # oid or coco
 if DS_TYPE == 'oid':
     CONFIG_FILE = './configs-oid/mask_rcnn_R_50_FPN_3x.yaml'
-    WEIGHTS  = './weights/model_final_f10217_without_roi_heads.pkl'
-    # WEIGHTS  = './output-save/model_0017999.pth'
+    WEIGHTS  = './output-epoch2/model_final.pth'
     DS_TRAIN = 'oid_train'
     DS_VALID = 'oid_validation'
 else:
@@ -125,9 +104,6 @@ logger = logging.getLogger("detectron2")
 
 
 # ____________________________ Main for Train __________________________________
-# noinspection DuplicatedCode,PyMethodMayBeStatic
-
-@profile
 def do_test(cfg, model):
     for dataset_name in cfg.DATASETS.TEST:
         # data_loader = build_detection_test_loader(cfg, dataset_name)
@@ -168,29 +144,16 @@ def do_test(cfg, model):
         )
 
         results_i = inference_on_dataset(model, data_loader, evaluator)
-        # torch.cuda.empty_cache()
-        # if comm.is_main_process():
-        #     comm.synchronize()
-        #     state_and_ids_list = comm.gather(evaluator.state_and_ids_list, dst=0)
-        #
-        #     from object_detection.utils import object_detection_evaluation as tfod_evaluation
-        #     merged = tfod_evaluation.OpenImagesChallengeEvaluator(evaluator, True)
-        #     for state, ids in state_and_ids_list:
-        #         merged.merge_internal_state(ids, state)
-        #
-        #     metrics = merged.evaluate()
-        #     results_i = OrderedDict({'instance-segmentation': metrics})
-        #
-        #     logger.info("Evaluation results for {} in csv format:".format(dataset_name))
-        #     # print_csv_format(results_i)
-        #     for tsk, res in results_i.items():
-        #         res_df = pd.DataFrame(pd.Series(res, name='value'))
-        #         res_df = res_df[res_df['value'].notna()]
-        #         # res_df = res_df[res_df['value'] > 0]
-        #         res_df.index = res_df.index.map(lambda x: '/'.join(x.split('/')[1:]))
-        #         pd.set_option('display.max_rows', None)
-        #         print(res_df)
-        #         pd.reset_option('display.max_rows')
+        if comm.is_main_process():
+            logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+            # print_csv_format(results_i)
+            for tsk, res in results_i.items():
+                res_df = pd.DataFrame(pd.Series(res, name='value'))
+                res_df = res_df[res_df['value'].notna()]
+                res_df.index = res_df.index.map(lambda x: '/'.join(x.split('/')[1:]))
+                pd.set_option('display.max_rows', None)
+                print(res_df)
+                pd.reset_option('display.max_rows')
 
 
 def main(args):
@@ -212,6 +175,8 @@ def main(args):
         if 'build_model(cfg)':
             meta_arch = cfg.MODEL.META_ARCHITECTURE
             model = META_ARCH_REGISTRY.get(meta_arch)(cfg)
+            # for param in model.backbone.parameters():
+            #     param.requires_grad = False
             model.to(torch.device(cfg.MODEL.DEVICE))
         # __________________ For Debug _____________________________
         # mem_stats_df.record('After-Build-Model')
@@ -229,30 +194,7 @@ def main(args):
         )
 
     if 'do-train':
-        if 'build_detection_train_loader':
-            if 'coco_2017_train' in cfg.DATASETS.TRAIN:
-                descs_train: List[Dict] = DatasetCatalog.get("coco_2017_train")
-                ds_train = DatasetFromList(descs_train, copy=False)
-                mapper = DatasetMapper(cfg, True)
-            else:  # Open-Image-Dataset
-                if 'get_detection_dataset_dicts':
-                    descs_train: List[Dict] = DatasetCatalog.get("oid_train")
-                ds_train = DatasetFromList(descs_train, copy=False)
-                if 'DatasetMapper':
-                    augs = build_augmentation(cfg, is_train=True)
-                    mapper = make_mapper('oid_train', is_train=True, augmentations=T.AugmentationList(augs))
-            ds_train = MapDataset(ds_train, mapper)
-
-            sampler = TrainingSampler(len(ds_train))
-            data_loader = build_batch_data_loader(
-                ds_train,
-                sampler,
-                cfg.SOLVER.IMS_PER_BATCH,
-                aspect_ratio_grouping=cfg.DATALOADER.ASPECT_RATIO_GROUPING,
-                num_workers=cfg.DATALOADER.NUM_WORKERS,
-            )
-            global DATA_LOADER
-            DATA_LOADER = data_loader
+        dataloader = build_train_dataloader(cfg)
 
         if N_GPUS > 0:
             cfg, model, resume = cfg, model, args.resume
@@ -262,7 +204,7 @@ def main(args):
             scheduler = build_lr_scheduler(cfg, optimizer)
 
             checkpointer = DetectionCheckpointer(
-                model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler
+                model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler,
             )
             # "iteration" always be loaded whether resume or not.
             # "model" state_dict will always be loaded whether resume or not.
@@ -272,8 +214,10 @@ def main(args):
             max_iter = cfg.SOLVER.MAX_ITER
             # optimizer and scheduler will be resume to checkpointer.checkpointables[*] if resume is True
             if resume:
-                optimizer = checkpointer.checkpointables['optimizer']
-                scheduler = checkpointer.checkpointables['scheduler']
+                optimizer  = checkpointer.checkpointables['optimizer']
+                scheduler  = checkpointer.checkpointables['scheduler']
+            else:
+                start_iter = 0
 
             periodic_checkpointer = PeriodicCheckpointer(
                 checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, max_iter=max_iter
@@ -291,8 +235,8 @@ def main(args):
             logger.info("Starting training from iteration {}".format(start_iter))
 
             with EventStorage(start_iter) as storage:
-                for data, iteration in zip(data_loader, range(start_iter, max_iter)):
-                    iteration = iteration + 1
+                for data, itr in zip(dataloader, range(start_iter, max_iter)):
+                    iteration = itr + 1
                     storage.step()
 
                     loss_dict = model(data)
@@ -340,6 +284,44 @@ def main(args):
             # mem_stats_df.dump('./mem_stats_df.csv')
 
 
+def build_train_dataloader(cfg):  # like 'build_detection_train_loader'
+    if 'coco_2017_train' in cfg.DATASETS.TRAIN:
+        descs_train: List[Dict] = DatasetCatalog.get("coco_2017_train")
+        ds_train = DatasetFromList(descs_train, copy=False)
+        mapper = DatasetMapper(cfg, True)
+    else:  # Open-Image-Dataset
+        if 'get_detection_dataset_dicts':
+            all_descs_train: List[Dict] = DatasetCatalog.get("oid_train")
+        if 'rebalancing':
+            image_id_vs_idx = {}
+            for idx, desc in enumerate(all_descs_train):
+                image_id_vs_idx[desc['image_id']] = idx
+            descs_train = list(map(lambda img_id: all_descs_train[image_id_vs_idx[img_id]], sample_image_ids()))
+            print('_' * 50 + f'train dataset len: {len(descs_train)}')
+
+        ds_train = DatasetFromList(descs_train, copy=False)
+
+        if 'DatasetMapper':
+            augs = [RandomContrast(0.8, 1.2),
+                    RandomBrightness(0.8, 1.2),
+                    RandomSaturation(0.8, 1.2)]
+            augs.extend(build_augmentation(cfg, is_train=True))
+            mapper = make_mapper('oid_train', is_train=True, augmentations=T.AugmentationList(augs))
+    ds_train = MapDataset(ds_train, mapper)
+
+    sampler = TrainingSampler(len(ds_train))
+    data_loader = build_batch_data_loader(
+        ds_train,
+        sampler,
+        cfg.SOLVER.IMS_PER_BATCH,
+        aspect_ratio_grouping=cfg.DATALOADER.ASPECT_RATIO_GROUPING,
+        num_workers=cfg.DATALOADER.NUM_WORKERS,
+    )
+    global DATA_LOADER
+    DATA_LOADER = data_loader
+    return data_loader
+
+
 if __name__ == "__main__":
     if '--config-file' in sys.argv:
         CLI_ARGS = sys.argv[1:]
@@ -348,15 +330,15 @@ if __name__ == "__main__":
             '--config-file', f'{CONFIG_FILE}', '--num-gpus', f'{N_GPUS}',
             '--dist-url', 'auto',
             # '--eval-only',
-            '--resume',
+            # '--resume',
             'MODEL.WEIGHTS', f'{WEIGHTS}',
             'DATASETS.TRAIN', f'("{DS_TRAIN}", )', 'DATASETS.TEST', f'("{DS_VALID}", )',
             'SOLVER.IMS_PER_BATCH', f'{BATCH_SIZE}',
-            'SOLVER.BASE_LR', '0.0025',
+            'SOLVER.BASE_LR', '0.0010',
             'SOLVER.MAX_ITER', f'{N_STEPS}',
             'SOLVER.STEPS', f'{MILESTONES}',
-            'TEST.EVAL_PERIOD', '10',
-            'SOLVER.CHECKPOINT_PERIOD', '3000',
+            'TEST.EVAL_PERIOD', '5000',
+            'SOLVER.CHECKPOINT_PERIOD', '5000',
             # For Debug ____________________
             # INPUT.FORMAT?  INPUT.MASK_FORMAT?
             # 'MODEL.DEVICE', 'gpu' if N_GPU > 0 else 'cpu',
